@@ -41,6 +41,8 @@ const H = 22;             // character rows
 const SY = 1.15;
 const FOV = 90;
 let W = 150, SX = 2.4;    // columns and x-scale — recomputed to fit the viewport
+let fsPx = 13;            // cached font size, so the frame loop never reads style
+let chars, zbuf;          // render buffers, reused every frame to avoid GC churn
 
 const chR = document.getElementById("ch-r");
 const chG = document.getElementById("ch-g");
@@ -50,8 +52,11 @@ const chB = document.getElementById("ch-b");
 // many columns actually fit. Guessing the advance from font-size is what makes
 // the grid overflow on narrow screens.
 function fit() {
-  const fs = Math.max(6, Math.min(13, innerWidth / 48));
-  document.documentElement.style.setProperty("--fs", fs + "px");
+  // visualViewport is the honest width on iOS once the toolbars are involved
+  const vw = Math.round((window.visualViewport && visualViewport.width) || innerWidth);
+
+  fsPx = Math.max(6, Math.min(13, vw / 48));
+  document.documentElement.style.setProperty("--fs", fsPx + "px");
 
   const probe = document.createElement("pre");
   probe.className = "ch";
@@ -61,10 +66,17 @@ function fit() {
   const advance = probe.getBoundingClientRect().width / 100;
   probe.remove();
 
-  W = Math.max(60, Math.min(150, Math.floor((innerWidth - 2) / advance)));
+  // if the probe measured nothing (font not ready yet) fall back to a
+  // conservative 0.62em advance rather than dividing by zero
+  const adv = advance > 0 ? advance : fsPx * 0.62;
+
+  W = Math.max(60, Math.min(150, Math.floor((vw - 2) / adv)));
   // baseSX holds the on-screen span constant across faces, so switching case
   // doesn't change how wide the banner sits
   SX = (W / 150) * geom.baseSX;
+
+  chars = new Array(W * H);
+  zbuf  = new Array(W * H);
 }
 
 // `disp` is the lens-dispersion factor: each colour channel focuses slightly
@@ -72,8 +84,8 @@ function fit() {
 // at the centre and grows toward the edges, like a real lens.
 function render(angle, disp) {
   const sin = Math.sin(angle), cos = Math.cos(angle);
-  const chars = new Array(W * H).fill(" ");
-  const zbuf  = new Array(W * H).fill(-Infinity);
+  chars.fill(" ");
+  zbuf.fill(-Infinity);
 
   for (const p of pts) {
     const rx = p.x * cos + p.z * sin;
@@ -117,8 +129,9 @@ function frame() {
   chB.textContent = render(angle + lag, 1 - a);
 
   // lateral split, opposite for r and b, with a slight vertical shear.
-  // scaled off font size so the split stays proportional on small screens
-  const px = a * 170 * (parseFloat(getComputedStyle(chR).fontSize) / 13);
+  // scaled off the cached font size — reading computed style here would force
+  // a style recalc on every frame, which is expensive on mobile
+  const px = a * 170 * (fsPx / 13);
   chR.style.transform = `translate(${ px.toFixed(2) }px, ${ (-px * 0.18).toFixed(2) }px)`;
   chB.style.transform = `translate(${ (-px).toFixed(2) }px, ${ (px * 0.18).toFixed(2) }px)`;
 
@@ -130,10 +143,17 @@ fit();
 frame();
 
 let resizeTimer;
-addEventListener("resize", () => {
+function scheduleFit() {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(fit, 120);
-});
+}
+addEventListener("resize", scheduleFit);
+// iOS does not always fire resize on rotation, and fires it before the new
+// viewport is settled when it does
+addEventListener("orientationchange", () => setTimeout(fit, 250));
+if (window.visualViewport) visualViewport.addEventListener("resize", scheduleFit);
+// re-measure once webfonts/metrics settle, in case the first probe was early
+addEventListener("load", () => setTimeout(fit, 50));
 
 addEventListener("click", () => { paused = !paused; });
 addEventListener("keydown", e => {
