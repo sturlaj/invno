@@ -22,6 +22,7 @@
     white-space: pre;
     user-select: none;
     mix-blend-mode: screen;   /* r+g+b overlap -> white core, fringes where they diverge */
+    text-shadow: 0 0 10px currentColor;   /* per-channel bloom, so the fringes glow */
   }
   /* channels stack on top of each other; the red one holds the layout */
   #ch-g, #ch-b { position: absolute; inset: 0; }
@@ -108,20 +109,25 @@ const chR = document.getElementById("ch-r");
 const chG = document.getElementById("ch-g");
 const chB = document.getElementById("ch-b");
 
-let angle = 0, speed = 0.028, paused = false;
+let angle = 0, speed = 0.016, paused = false;
 
 function frame() {
   // pulse the aberration so it breathes instead of sitting static
-  const a = 0.011 + Math.sin(angle * 0.7) * 0.006;
+  const a = 0.034 + Math.sin(angle * 0.7) * 0.020;
+  // temporal split: red trails the rotation, blue leads it. This is what really
+  // sells the effect -- the channels disagree about *where the object is*, not
+  // just how wide it projects, so the fringing swells as the banner turns.
+  const lag = 0.085 + Math.sin(angle * 0.9) * 0.040;
 
-  chR.textContent = render(angle, 1 + a);
-  chG.textContent = render(angle, 1);
-  chB.textContent = render(angle, 1 - a);
+  chR.textContent = render(angle - lag, 1 + a);
+  chG.textContent = render(angle,       1);
+  chB.textContent = render(angle + lag, 1 - a);
 
-  // sub-pixel lateral split, opposite directions for r and b
-  const px = a * 90;
-  chR.style.transform = `translateX(${ px.toFixed(2) }px)`;
-  chB.style.transform = `translateX(${ (-px).toFixed(2) }px)`;
+  // lateral split, opposite directions for r and b, with a slight vertical
+  // shear so the split isn't purely horizontal
+  const px = a * 170;
+  chR.style.transform = `translate(${ px.toFixed(2) }px, ${ (-px * 0.18).toFixed(2) }px)`;
+  chB.style.transform = `translate(${ (-px).toFixed(2) }px, ${ (px * 0.18).toFixed(2) }px)`;
 
   if (!paused) angle += speed;
   requestAnimationFrame(frame);
