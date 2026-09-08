@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inv.no — rotating ascii</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; height: 100%;
+    background: #05070a;
+    display: grid; place-items: center;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    overflow: hidden;
+  }
+  #stage { position: relative; }
+  pre {
+    margin: 0;
+    font-size: clamp(4px, 1.15vw, 13px);
+    line-height: 1.0;
+    letter-spacing: 0;
+    white-space: pre;
+    user-select: none;
+    mix-blend-mode: screen;   /* r+g+b overlap -> white core, fringes where they diverge */
+  }
+  /* channels stack on top of each other; the red one holds the layout */
+  #ch-g, #ch-b { position: absolute; inset: 0; }
+  #ch-r { color: #ff1030; }
+  #ch-g { color: #10ff70; }
+  #ch-b { color: #3050ff; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <pre id="ch-r"></pre>
+  <pre id="ch-g"></pre>
+  <pre id="ch-b"></pre>
+</div>
+<script>
+// 5x7 bitmap font — only the glyphs "inv.no" needs
+const FONT = {
+  I: ["11111","00100","00100","00100","00100","00100","11111"],
+  N: ["10001","11001","11001","10101","10011","10011","10001"],
+  V: ["10001","10001","10001","10001","01010","01010","00100"],
+  O: ["01110","10001","10001","10001","10001","10001","01110"],
+  ".":["00000","00000","00000","00000","00000","01100","01100"],
+};
+
+const TEXT   = "INV.NO";
+const GLYPH_W = 5, GLYPH_H = 7, TRACK = 6;
+const DEPTH   = 3;
+const RAMP    = "@#%x*+=~:-. ";
+
+const pts = [];
+{
+  const totalW = TEXT.length * TRACK - 1;
+  const cx = totalW / 2, cy = GLYPH_H / 2;
+  TEXT.split("").forEach((ch, i) => {
+    const g = FONT[ch];
+    if (!g) return;
+    for (let r = 0; r < GLYPH_H; r++)
+      for (let c = 0; c < GLYPH_W; c++)
+        if (g[r][c] === "1")
+          for (let d = -DEPTH; d <= DEPTH; d++)
+            pts.push({ x: i * TRACK + c - cx, y: r - cy, z: d * 0.6 });
+  });
+}
+
+const W = 150, H = 19;
+const SX = 2.6, SY = 1.3;
+const FOV = 90;
+
+// `disp` is the lens-dispersion factor: each colour channel focuses slightly
+// differently, so red projects a touch wider than blue. That divergence is the
+// chromatic aberration — it vanishes at the centre and grows toward the edges,
+// exactly like a real lens.
+function render(angle, disp) {
+  const sin = Math.sin(angle), cos = Math.cos(angle);
+  const chars = new Array(W * H).fill(" ");
+  const zbuf  = new Array(W * H).fill(-Infinity);
+
+  for (const p of pts) {
+    const rx = p.x * cos + p.z * sin;
+    const rz = -p.x * sin + p.z * cos;
+    const tilt = Math.sin(angle * 0.5) * 0.22;
+    const ry = p.y * Math.cos(tilt) - rz * Math.sin(tilt);
+    const rz2 = p.y * Math.sin(tilt) + rz * Math.cos(tilt);
+
+    const f = FOV / (FOV + rz2 + 25);
+    const sx = Math.round(rx * SX * disp * f + W / 2);
+    const sy = Math.round(ry * SY * disp * f + H / 2);
+    if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
+
+    const i = sy * W + sx;
+    if (-rz2 > zbuf[i]) {
+      zbuf[i] = -rz2;
+      const t = (rz2 + 22) / 44;
+      chars[i] = RAMP[Math.max(0, Math.min(RAMP.length - 1, Math.round(t * (RAMP.length - 1))))];
+    }
+  }
+
+  let out = "";
+  for (let y = 0; y < H; y++) out += chars.slice(y * W, y * W + W).join("") + "\n";
+  return out;
+}
+
+const chR = document.getElementById("ch-r");
+const chG = document.getElementById("ch-g");
+const chB = document.getElementById("ch-b");
+
+let angle = 0, speed = 0.028, paused = false;
+
+function frame() {
+  // pulse the aberration so it breathes instead of sitting static
+  const a = 0.011 + Math.sin(angle * 0.7) * 0.006;
+
+  chR.textContent = render(angle, 1 + a);
+  chG.textContent = render(angle, 1);
+  chB.textContent = render(angle, 1 - a);
+
+  // sub-pixel lateral split, opposite directions for r and b
+  const px = a * 90;
+  chR.style.transform = `translateX(${ px.toFixed(2) }px)`;
+  chB.style.transform = `translateX(${ (-px).toFixed(2) }px)`;
+
+  if (!paused) angle += speed;
+  requestAnimationFrame(frame);
+}
+frame();
+
+addEventListener("click", () => { paused = !paused; });
+addEventListener("keydown", e => {
+  if (e.key === "ArrowRight") speed += 0.006;
+  if (e.key === "ArrowLeft")  speed -= 0.006;
+});
+</script>
+</body>
+</html>
