@@ -1,39 +1,19 @@
 // Terminal version of the rotating inv.no banner.
-//   node demo/rotating-ascii.js           animate
+//   node demo/rotating-ascii.js           animate (uppercase)
+//   node demo/rotating-ascii.js --lower   animate lowercase
 //   node demo/rotating-ascii.js --frames  print 4 still frames and exit
 
-const FONT = {
-  I: ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
-  N: ["10001", "11001", "11001", "10101", "10011", "10011", "10001"],
-  V: ["10001", "10001", "10001", "10001", "01010", "01010", "00100"],
-  O: ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
-  ".": ["00000", "00000", "00000", "00000", "00000", "01100", "01100"],
-};
+const { buildPoints } = require("../font.js");
 
-const TEXT = "INV.NO";
-const GLYPH_W = 5, GLYPH_H = 7, TRACK = 6;
 const DEPTH = 3;
 const RAMP = "@#%x*+=~:-. ";
+const face = process.argv.includes("--lower") ? "lower" : "upper";
+const { pts, baseSX } = buildPoints(face, DEPTH);
 
 const W = Math.min(process.stdout.columns || 120, 150);
-const H = 19;
-const SX = (W / 150) * 2.6, SY = 1.3;
+const H = 22;
+const SX = (W / 150) * baseSX, SY = 1.15;
 const FOV = 90;
-
-const pts = [];
-{
-  const totalW = TEXT.length * TRACK - 1;
-  const cx = totalW / 2, cy = GLYPH_H / 2;
-  TEXT.split("").forEach((ch, i) => {
-    const g = FONT[ch];
-    if (!g) return;
-    for (let r = 0; r < GLYPH_H; r++)
-      for (let c = 0; c < GLYPH_W; c++)
-        if (g[r][c] === "1")
-          for (let d = -DEPTH; d <= DEPTH; d++)
-            pts.push({ x: i * TRACK + c - cx, y: r - cy, z: d * 0.6 });
-  });
-}
 
 function render(angle) {
   const sin = Math.sin(angle), cos = Math.cos(angle);
@@ -77,12 +57,11 @@ if (process.argv.includes("--frames")) {
   process.stdout.write("\x1b[?25l");
   const timer = setInterval(() => {
     process.stdout.write("\x1b[H\x1b[2J" + render(angle));
-    angle += 0.05;
+    angle += 0.03;
   }, 40);
-  const quit = () => {
+  process.on("SIGINT", () => {
     clearInterval(timer);
     process.stdout.write("\x1b[?25h\n");
     process.exit(0);
-  };
-  process.on("SIGINT", quit);
+  });
 }
