@@ -32,14 +32,16 @@
 const DEPTH = 3;                      // extrusion layers each way
 const RAMP  = "@#%x*+=~:-. ";
 
-// "upper" or "lower" — press C to switch. ?case=lower in the URL also works.
-let face = new URLSearchParams(location.search).get("case") === "lower" ? "lower" : "upper";
+// press C to cycle faces; ?case=upper|worm|lower in the URL also works
+const FACE_ORDER = ["upper", "worm", "lower"];
+const requested = new URLSearchParams(location.search).get("case");
+let face = FACE_ORDER.includes(requested) ? requested : FACE_ORDER[0];
 let geom = buildPoints(face, DEPTH);
 let pts  = geom.pts;
 
 const H = 22;             // character rows
-const SY = 1.15;
 const FOV = 90;
+let SY = 1.15;            // from the face, so all faces occupy the same height
 let W = 150, SX = 2.4;    // columns and x-scale — recomputed to fit the viewport
 let fsPx = 13;            // cached font size, so the frame loop never reads style
 let chars, zbuf;          // render buffers, reused every frame to avoid GC churn
@@ -71,9 +73,11 @@ function fit() {
   const adv = advance > 0 ? advance : fsPx * 0.62;
 
   W = Math.max(60, Math.min(150, Math.floor((vw - 2) / adv)));
-  // baseSX holds the on-screen span constant across faces, so switching case
-  // doesn't change how wide the banner sits
+  // baseSX/baseSY hold the on-screen span constant across faces, so switching
+  // doesn't change how large the banner sits — the worm is 14 rows tall
+  // against the other faces' 10
   SX = (W / 150) * geom.baseSX;
+  SY = geom.baseSY;
 
   chars = new Array(W * H);
   zbuf  = new Array(W * H);
@@ -160,7 +164,7 @@ addEventListener("keydown", e => {
   if (e.key === "ArrowRight") speed += 0.006;
   if (e.key === "ArrowLeft")  speed -= 0.006;
   if (e.key === "c" || e.key === "C") {
-    face = face === "upper" ? "lower" : "upper";
+    face = FACE_ORDER[(FACE_ORDER.indexOf(face) + 1) % FACE_ORDER.length];
     geom = buildPoints(face, DEPTH);
     pts  = geom.pts;
     fit();

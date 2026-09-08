@@ -1,18 +1,19 @@
 // Terminal version of the rotating inv.no banner.
 //   node demo/rotating-ascii.js           animate (uppercase)
-//   node demo/rotating-ascii.js --lower   animate lowercase
+//   node demo/rotating-ascii.js --worm / --lower   pick another face
 //   node demo/rotating-ascii.js --frames  print 4 still frames and exit
 
 const { buildPoints } = require("../font.js");
 
 const DEPTH = 3;
 const RAMP = "@#%x*+=~:-. ";
-const face = process.argv.includes("--lower") ? "lower" : "upper";
-const { pts, baseSX } = buildPoints(face, DEPTH);
+const face = process.argv.includes("--lower") ? "lower"
+  : process.argv.includes("--worm") ? "worm" : "upper";
+const { pts, baseSX, baseSY } = buildPoints(face, DEPTH);
 
 const W = Math.min(process.stdout.columns || 120, 150);
 const H = 22;
-const SX = (W / 150) * baseSX, SY = 1.15;
+const SX = (W / 150) * baseSX, SY = baseSY;
 const FOV = 90;
 
 function render(angle) {
