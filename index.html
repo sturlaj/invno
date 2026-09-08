@@ -56,9 +56,33 @@ const pts = [];
   });
 }
 
-const W = 150, H = 19;      // character grid
-const SX = 2.6, SY = 1.3;   // 2:1 because cells are twice as tall as wide
+const H = 19;             // character rows
+const SY = 1.3;
 const FOV = 90;
+let W = 150, SX = 2.6;    // columns and x-scale — recomputed to fit the viewport
+
+const chR = document.getElementById("ch-r");
+const chG = document.getElementById("ch-g");
+const chB = document.getElementById("ch-b");
+
+// Pick a legible font size, measure the real character advance, then derive how
+// many columns actually fit. Guessing the advance from font-size is what makes
+// the grid overflow on narrow screens.
+function fit() {
+  const fs = Math.max(6, Math.min(13, innerWidth / 48));
+  document.documentElement.style.setProperty("--fs", fs + "px");
+
+  const probe = document.createElement("pre");
+  probe.className = "ch";
+  probe.style.cssText = "position:absolute;visibility:hidden;mix-blend-mode:normal";
+  probe.textContent = "0".repeat(100);
+  document.body.appendChild(probe);
+  const advance = probe.getBoundingClientRect().width / 100;
+  probe.remove();
+
+  W = Math.max(60, Math.min(150, Math.floor((innerWidth - 2) / advance)));
+  SX = (W / 150) * 2.6;
+}
 
 // `disp` is the lens-dispersion factor: each colour channel focuses slightly
 // differently, so red projects a touch wider than blue. The divergence is nil
@@ -88,14 +112,12 @@ function render(angle, disp) {
     }
   }
 
+  // every row is padded to exactly W chars so all three channels have
+  // identical box widths — without this they drift apart
   let out = "";
   for (let y = 0; y < H; y++) out += chars.slice(y * W, y * W + W).join("") + "\n";
   return out;
 }
-
-const chR = document.getElementById("ch-r");
-const chG = document.getElementById("ch-g");
-const chB = document.getElementById("ch-b");
 
 let angle = 0, speed = 0.016, paused = false;
 
@@ -111,15 +133,24 @@ function frame() {
   chG.textContent = render(angle,       1);
   chB.textContent = render(angle + lag, 1 - a);
 
-  // lateral split, opposite for r and b, with a slight vertical shear
-  const px = a * 170;
+  // lateral split, opposite for r and b, with a slight vertical shear.
+  // scaled off font size so the split stays proportional on small screens
+  const px = a * 170 * (parseFloat(getComputedStyle(chR).fontSize) / 13);
   chR.style.transform = `translate(${ px.toFixed(2) }px, ${ (-px * 0.18).toFixed(2) }px)`;
   chB.style.transform = `translate(${ (-px).toFixed(2) }px, ${ (px * 0.18).toFixed(2) }px)`;
 
   if (!paused) angle += speed;
   requestAnimationFrame(frame);
 }
+
+fit();
 frame();
+
+let resizeTimer;
+addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(fit, 120);
+});
 
 addEventListener("click", () => { paused = !paused; });
 addEventListener("keydown", e => {

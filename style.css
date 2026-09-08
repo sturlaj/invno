@@ -10,25 +10,31 @@ html, body {
   place-items: center;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   overflow: hidden;
+  -webkit-text-size-adjust: 100%;   /* iOS inflates text otherwise */
 }
 
-#stage { position: relative; }
+/* All three channels share one grid cell, so they get byte-identical boxes.
+   Do NOT stack them by leaving one in flow and absolutely positioning the
+   others -- that makes the in-flow one the odd man out and iOS Safari
+   resolves the boxes differently, shifting two channels against the third. */
+#stage {
+  display: grid;
+  grid-template: 1fr / 1fr;
+  justify-items: start;
+}
 
-/* One <pre> per colour channel, stacked. Screen blending means the channels
-   sum to white where they agree and leave coloured fringes where they don't. */
 .ch {
+  grid-area: 1 / 1;
   margin: 0;
-  font-size: clamp(4px, 1.15vw, 13px);
+  font-size: var(--fs, 11px);
   line-height: 1;
   letter-spacing: 0;
   white-space: pre;
+  text-align: left;
   user-select: none;
   mix-blend-mode: screen;
   text-shadow: 0 0 10px currentColor;
 }
-
-/* the red channel holds the layout; the other two float on top of it */
-#ch-g, #ch-b { position: absolute; inset: 0; }
 
 #ch-r { color: #ff1030; }
 #ch-g { color: #10ff70; }
@@ -37,9 +43,10 @@ html, body {
 /* static art for no-JS clients */
 .fallback {
   margin: 0;
-  font-size: clamp(4px, 1.15vw, 13px);
+  font-size: var(--fs, 11px);
   line-height: 1;
   white-space: pre;
+  text-align: left;
   color: #7dffc3;
   text-shadow: 0 0 8px rgba(125, 255, 195, .4);
 }
