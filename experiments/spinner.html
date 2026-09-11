@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inv.no — spinner</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100dvh; cursor: grab; touch-action: none; }
+  canvas.drag { cursor: grabbing; }
+  /* chunky variant: upscale the low-res buffer with hard pixel edges rather
+     than letting the browser smooth it, which is the whole point of the look */
+  canvas.pixelated {
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: crisp-edges;
+  }
+  #err {
+    position: fixed; inset: 0; margin: 0; padding: 1rem;
+    font: 11px/1.45 ui-monospace, Consolas, monospace;
+    color: #ff6b8a; background: #0a0306; white-space: pre-wrap;
+    overflow: auto; display: none;
+  }
+  #hud {
+    position: fixed; left: 10px; bottom: 8px;
+    font: 10px/1.5 ui-monospace, Consolas, monospace;
+    color: #3c4650; opacity: .7; pointer-events: none; display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<pre id="err"></pre>
+<div id="hud"></div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec2  uLook;
+uniform float uExposure;
+uniform float uFrame;      // >1 leaves more empty space around the mark
+
+#define PI 3.141592653589793
+
+const float R      = 0.130;   // stroke radius -- uniform, like the bitmap faces
+const float THICK  = 0.150;   // half-depth of the extrusion
+const float CR     = 0.003;   // corner radius -- near-sharp
+const float ROUND  = 0.012;   // edge fillet; tight, so the highlight is a thin hard line
+const float FOVF   = 1.05;
+const vec2  HALF   = vec2(2.498, 0.736);   // measured half-extent of the mark
+const vec3  ALBEDO = vec3(0.012);   // near-black lacquer
+const float ROUGH  = 0.055;   // high gloss
+
+// ===========================================================================
+// 2D WORDMARK -- "inv.no" as signed distance. Helvetica-ish lowercase: flat
+// terminal cuts on the stems, round i-dot and period, stress on the o.
+
+// ===========================================================================
+float sdSeg(vec2 p, vec2 a, vec2 b, float r) {
+  vec2 pa = p - a, ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h) - r;
+}
+
+// Helvetica cuts its terminals flat, horizontally or vertically -- never round.
+// So stems are boxes, with only a hairline corner radius to give the gloss an
+// edge to catch.
+float sdBox(vec2 p, vec2 c, vec2 h, float r) {
+  vec2 q = abs(p - c) - h + r;
+  return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+}
+
+// The o is near-circular but the stroke is thicker at 3 and 9 o'clock than at
+// top and bottom. That stress is most of what makes a grotesque look drawn
+// rather than geometric.
+float sdOh(vec2 p, vec2 c, float rad) {
+  vec2 q = p - c;
+  float L = length(q);
+  float side = abs(q.x) / max(L, 1e-4);
+  return abs(L - rad) - (0.112 + 0.030 * side);
+}
+
+// lowercase n: full-height left stem, shoulder springing off it, short right
+// stem. The shoulder's own end caps sit inside the stems, so they never show.
+float sdEnn(vec2 p, float x) {
+  float d = sdBox(p, vec2(x, 0.50), vec2(R, 0.50), CR);
+  vec2 q = p - vec2(x + 0.33, 0.54);
+  float arch = (q.y >= 0.0)
+    ? abs(length(q) - 0.33) - R
+    : min(length(q - vec2(-0.33, 0.0)), length(q - vec2(0.33, 0.0))) - R;
+  d = min(d, arch);
+  d = min(d, sdBox(p, vec2(x + 0.66, 0.27), vec2(R, 0.27), CR));
+  return d;
+}
+
+// lowercase v: two strokes cut flat at x-height and at the baseline
+float sdVee(vec2 p, float x) {
+  float d = min(sdSeg(p, vec2(x, 1.10),        vec2(x + 0.34, -0.06), R),
+                sdSeg(p, vec2(x + 0.34, -0.06), vec2(x + 0.68, 1.10), R));
+  d = max(d,  p.y - 1.00);
+  d = max(d, -p.y);
+  return d;
+}
+
+float sdWord(vec2 p) {
+  float d = 1e9;
+
+  // i -- flat-cut stem, round dot (same radius as the period so the two
+  // matching marks carry the same weight)
+  d = min(d, sdBox(p, vec2(0.0, 0.50), vec2(R, 0.50), CR));
+  d = min(d, length(p - vec2(0.0, 1.33)) - 0.145);
+
+  d = min(d, sdEnn(p, 0.44));
+  d = min(d, sdVee(p, 1.52));
+
+  // . -- round. Slightly wider than the stem so it carries the same weight
+  // a square dot would; a disc of exactly R reads light next to flat cuts.
+  d = min(d, length(p - vec2(2.56, 0.145)) - 0.145);
+
+  d = min(d, sdEnn(p, 2.92));
+  d = min(d, sdOh(p, vec2(4.342, 0.50), 0.37));
+
+  return d;
+}
+
+// ===========================================================================
+// 3D MODEL -- rounded extrusion of the wordmark
+// ===========================================================================
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+
+float sdModel(vec3 p) {
+  // slow turn on Y only
+  float spin = uTime * 0.28 + uLook.x;
+  float nod  = uLook.y;             // no automatic tilt; drag only
+
+  // rotate the query point into model space, THEN shift into the wordmark's
+  // own coordinate frame. Offsetting before the rotation would make the object
+  // orbit the origin instead of spinning in place -- and the sign must be +,
+  // so model-space (0,0) lands on the wordmark's measured centre.
+  p.xz = rot(spin) * p.xz;
+  p.yz = rot(nod)  * p.yz;
+
+  float d2 = sdWord(p.xy + vec2(2.355, 0.739));   // measured bbox centre
+  vec2  w  = vec2(d2, abs(p.z) - THICK);
+  return min(max(w.x, w.y), 0.0) + length(max(w, 0.0)) - ROUND;
+}
+
+// Tetrahedral normal: four taps instead of the six a central difference needs.
+// Same accuracy in practice, and the normal is evaluated for every shaded
+// pixel of every supersample, so it is the hottest call in the shader.
+vec3 normalAt(vec3 p) {
+  const vec2 k = vec2(1.0, -1.0);
+  float e = 0.0015;
+  return normalize(k.xyy * sdModel(p + k.xyy * e)
+                 + k.yyx * sdModel(p + k.yyx * e)
+                 + k.yxy * sdModel(p + k.yxy * e)
+                 + k.xxx * sdModel(p + k.xxx * e));
+}
+
+// ===========================================================================
+// ENVIRONMENT
+// ---------------------------------------------------------------------------
+// A dark studio: nothing but a few bright strip softboxes. Because the object
+// is almost black, the *only* thing you see is these strips reflected in it --
+// which is the whole point. The form reads from moving highlights, not from
+// diffuse shading.
+// ===========================================================================
+vec3 env(vec3 d) {
+  vec3 c = vec3(0.0);
+
+  // long horizontal softbox, high and slightly behind
+  float a = smoothstep(0.20, 0.015, abs(d.y - 0.42))
+          * smoothstep(-0.85, 0.15, d.z);
+  c += vec3(0.80, 0.87, 1.00) * 3.4 * a;
+
+  // narrow vertical strip, camera left -- gives the edge-on glints
+  float b = smoothstep(0.13, 0.010, abs(d.x + 0.68))
+          * smoothstep(-0.75, 0.35, d.y);
+  c += vec3(1.00, 0.93, 0.82) * 2.6 * b;
+
+  // second, tighter strip from the right, cooler
+  float e = smoothstep(0.085, 0.006, abs(d.x - 0.80))
+          * smoothstep(-0.5, 0.5, d.y);
+  c += vec3(0.70, 0.82, 1.00) * 2.1 * e;
+
+  // faint floor bounce so the undersides aren't absolute void
+  c += vec3(0.028, 0.031, 0.040) * smoothstep(0.1, -0.8, d.y);
+
+  return c;
+}
+
+float ggx(vec3 n, vec3 v, vec3 l, float rough) {
+  float a = max(rough * rough, 1e-4);
+  vec3  h = normalize(v + l);
+  float NoH = max(dot(n, h), 0.0);
+  float NoV = max(dot(n, v), 1e-3);
+  float NoL = max(dot(n, l), 0.0);
+  float dd  = NoH * NoH * (a * a - 1.0) + 1.0;
+  float D   = (a * a) / (PI * dd * dd);
+  float k   = a * 0.5;
+  float G   = (NoL / (NoL * (1.0 - k) + k)) * (NoV / (NoV * (1.0 - k) + k));
+  return D * G / (4.0 * NoV * max(NoL, 1e-3)) * NoL;
+}
+
+// Cheap SDF ambient occlusion -- keeps the inner corners from glowing.
+// Three taps rather than five: the mark is mostly convex slabs, so the extra
+// two contributed almost nothing for 40% of this function's cost.
+float ao(vec3 p, vec3 n) {
+  float occ = 0.0, sca = 1.0;
+  for (int i = 0; i < 3; i++) {
+    float hr = 0.02 + 0.14 * float(i);
+    occ += (hr - sdModel(p + n * hr)) * sca;
+    sca *= 0.72;
+  }
+  return clamp(1.0 - 2.1 * occ, 0.0, 1.0);
+}
+
+vec3 aces(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+float hash12(vec2 p) {
+  vec3 q = fract(vec3(p.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.x + q.y) * q.z);
+}
+
+// The whole mark, through every rotation, fits inside a sphere about the
+// origin: sqrt(HALF.x^2 + HALF.y^2 + (THICK+ROUND)^2).
+const float BOUND = 2.72;   // measured extent is 2.609; margin so the
+                            // silhouette is never clipped by the early-out
+
+bool hitBound(vec3 ro, vec3 rd, out float t0, out float t1) {
+  float b = dot(ro, rd);
+  float c = dot(ro, ro) - BOUND * BOUND;
+  float h = b * b - c;
+  if (h < 0.0) return false;
+  h  = sqrt(h);
+  t0 = -b - h;
+  t1 = -b + h;
+  return t1 > 0.0;
+}
+
+vec3 shade(vec2 uv, float dist) {
+  vec3 ro = vec3(0.0, 0.0, -dist);
+  vec3 rd = normalize(vec3(uv * FOVF, 1.0));
+
+  // Most of the frame is empty. Testing the bounding sphere first lets those
+  // pixels cost one quadratic instead of a full march, and lets the rays that
+  // do hit start at the sphere entry rather than at the camera -- which is
+  // what makes 4x supersampling affordable.
+  float t0, t1;
+  if (!hitBound(ro, rd, t0, t1)) return vec3(0.0);
+
+  float t    = max(t0, 0.0);
+  float tend = t1;
+  bool  hit  = false;
+
+  for (int i = 0; i < STEPS; i++) {
+    vec3  p = ro + rd * t;
+    float d = sdModel(p);
+    if (d < 0.0004 * t + 0.00025) { hit = true; break; }
+    t += d * 0.92;                 // slight underrelaxation; the extrusion
+    if (t > tend) break;           // has thin features that overshoot easily
+  }
+  if (!hit) return vec3(0.0);
+
+  vec3 p = ro + rd * t;
+  vec3 n = normalAt(p);
+  vec3 v = -rd;
+
+  float F   = 0.040 + 0.960 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+  float occ = ao(p, n);
+
+  // mirror reflection of the strips -- at this roughness it reads sharp
+  vec3 refl = env(reflect(rd, n)) * occ;
+
+  // the near-black body: almost nothing, which is the point
+  vec3 diffuse = ALBEDO * env(n) * 0.25 * occ;
+
+  // two explicit lights matching the strips, for crisp specular cores
+  vec3 l1 = normalize(vec3( 0.25, 0.72, -0.65));
+  vec3 l2 = normalize(vec3(-0.82, 0.30, -0.48));
+  vec3 spec = vec3(0.80, 0.87, 1.00) * 2.1 * ggx(n, v, l1, ROUGH)
+            + vec3(1.00, 0.93, 0.82) * 1.6 * ggx(n, v, l2, ROUGH);
+
+  return diffuse + refl * F + spec;
+}
+
+void main() {
+  // Pull the camera back far enough that the wordmark fits. It is 4.99 wide
+  // against 1.46 tall, so on a portrait phone the width is what binds -- a
+  // fixed distance crops it badly there.
+  float aspect = uRes.x / uRes.y;
+  float needX = HALF.x * uFrame / (0.5 * aspect * FOVF);
+  float needY = HALF.y * uFrame / (0.5 * FOVF);
+  // floor of 3.25: edge-on the wordmark is 2.5 deep, so the camera has to
+  // clear that however wide the viewport is
+  float dist = max(max(needX, needY), 3.25) + 0.75;
+
+  // Rotated-grid supersampling. Thin bright highlights on a black field are
+  // the worst case for aliasing, and they are interior to the silhouette, so
+  // edge-coverage tricks do not help -- only more rays do. Averaged in linear
+  // light, before the tonemap, which is the only correct place to do it.
+  vec3 col = vec3(0.0);
+  const mat2 skew = mat2(0.8944, -0.4472, 0.4472, 0.8944);
+
+  for (int j = 0; j < AA; j++) {
+    for (int i = 0; i < AA; i++) {
+      vec2 o = (vec2(float(i), float(j)) + 0.5) / float(AA) - 0.5;
+      vec2 uv = (gl_FragCoord.xy + skew * o - 0.5 * uRes) / uRes.y;
+      col += shade(uv, dist);
+    }
+  }
+  col /= float(AA * AA);
+
+  col *= uExposure;
+  col = aces(col);
+  col = pow(col, vec3(0.4545));
+
+  // dither: a black frame with faint gradients bands horribly without it
+  col += (hash12(gl_FragCoord.xy + fract(uTime) * 71.3) - 0.5) / 255.0;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hud    = document.getElementById("hud");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  canvas.style.display = "none";
+  hud.style.display = "none";
+}
+
+const gl = canvas.getContext("webgl", { antialias: false, alpha: false, depth: false, powerPreference: "high-performance" })
+        || canvas.getContext("experimental-webgl");
+if (!gl) fail("WebGL is not available in this browser.");
+
+const params = new URLSearchParams(location.search);
+if (params.has("hud")) hud.style.display = "block";   // dev readout, off by default
+const mobile = matchMedia("(pointer: coarse)").matches;
+
+// Quality ladder, cheapest first. `AA` is the supersampling grid (AA=2 means
+// 2x2 = 4 rays per pixel) and `scale` renders above display density for the
+// browser to downsample, so cost scales as (scale * AA)^2. The renderer walks
+// up and down this ladder to hold the target frame rate, because there is no
+// way to know in advance what GPU this is running on.
+// Rungs are spaced ~1.4-1.7x apart in cost. Even spacing matters: a 4x jump
+// between neighbours makes the controller flip back and forth across it
+// forever, which looks far worse than just sitting on the lower rung.
+const LADDER = [
+  { AA: 1, scale: 0.60, STEPS: 56 },
+  { AA: 1, scale: 0.85, STEPS: 64 },
+  { AA: 1, scale: 1.15, STEPS: 72 },
+  { AA: 2, scale: 0.70, STEPS: 72 },
+  { AA: 2, scale: 0.90, STEPS: 72 },
+  { AA: 2, scale: 1.15, STEPS: 72 },
+  { AA: 3, scale: 0.85, STEPS: 80 },
+  { AA: 3, scale: 1.10, STEPS: 80 },
+  { AA: 3, scale: 1.40, STEPS: 80 },
+];
+
+// `?px=N` renders into an N-pixel-tall buffer and upscales it with hard pixel
+// edges -- the chunky variant. Resolution is fixed by definition, so this also
+// turns adaptation off; AA still applies, and is what decides whether each
+// chunky pixel is a clean average or a single hard-aliased sample.
+// The chunky look is the default. ?px=0 (or ?px=off) gives the smooth,
+// full-resolution version instead; any other value sets the buffer height.
+const pxRaw   = params.get("px");
+const pxParam = parseInt(pxRaw, 10);
+const PX = pxRaw === null                        ? 240
+         : (pxRaw === "0" || pxRaw === "off")    ? 0
+         : (isFinite(pxParam) && pxParam > 8)    ? Math.min(pxParam, 2000)
+         : 240;
+if (PX) canvas.classList.add("pixelated");
+
+// `?q=` pins a rung and turns adaptation off; otherwise it self-tunes.
+const Q_NAMES = { low: 1, medium: 4, high: 6, ultra: 8 };
+const pinned  = params.get("q");
+const adaptive = !PX && !(pinned !== null && pinned in Q_NAMES);
+// Start high and fall. A vsync-capped frame delta reads ~16.7ms no matter how
+// much headroom the GPU has, so climbing is unreliable at exactly 60Hz --
+// dropping is not. Starting near the top and letting the controller settle
+// downward is the only way to actually use a fast GPU.
+// In pixel mode `scale` is ignored (PX sets the buffer directly), so the rung
+// only selects AA. Default to `low` = AA 1: one ray per chunky pixel, which is
+// the harder-edged look rather than a smooth average per block.
+let rung = pinned !== null && pinned in Q_NAMES ? Q_NAMES[pinned]
+         : PX ? Q_NAMES.low
+         : (mobile ? 4 : LADDER.length - 1);
+
+const targetFpsParam = parseFloat(params.get("fps"));
+const TARGET_FPS = isFinite(targetFpsParam) ? targetFpsParam : 60;
+
+function compile(type, src, label) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    const numbered = src.split("\n").map((l, i) => String(i + 1).padStart(4) + " | " + l).join("\n");
+    throw new Error(label + " shader failed to compile:\n\n" + log + "\n\n" + numbered);
+  }
+  return s;
+}
+
+// STEPS and AA are compile-time constants (GLSL ES 1.00 needs constant loop
+// bounds), so switching rung means switching program. Build one per distinct
+// (AA, STEPS) pair up front -- compiling mid-animation would stutter.
+const built = new Map();
+let vertShader = null, quadBuf = null, ok = false;
+
+function buildProgram(AA, STEPS) {
+  const key = AA + ":" + STEPS;
+  if (built.has(key)) return built.get(key);
+  const fsSrc = `#define STEPS ${STEPS}\n#define AA ${AA}\n`
+              + document.getElementById("fs").textContent;
+  const p = gl.createProgram();
+  gl.attachShader(p, vertShader);
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc, "fragment (AA=" + AA + ")"));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error("program failed to link:\n\n" + gl.getProgramInfoLog(p));
+  const U = {};
+  for (const k of ["uRes", "uTime", "uLook", "uExposure", "uFrame"]) U[k] = gl.getUniformLocation(p, k);
+  const rec = { prog: p, U, aPos: gl.getAttribLocation(p, "aPos") };
+  built.set(key, rec);
+  return rec;
+}
+
+try {
+  vertShader = compile(gl.VERTEX_SHADER, document.getElementById("vs").textContent, "vertex");
+
+  quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+
+  for (const L of LADDER) buildProgram(L.AA, L.STEPS);
+  ok = true;
+} catch (e) {
+  fail(String(e.message || e));
+}
+
+let current = null;
+function useRung(i) {
+  const L = LADDER[i];
+  const rec = buildProgram(L.AA, L.STEPS);
+  if (current !== rec) {
+    gl.useProgram(rec.prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.enableVertexAttribArray(rec.aPos);
+    gl.vertexAttribPointer(rec.aPos, 2, gl.FLOAT, false, 0, 0);
+    current = rec;
+  }
+  return rec;
+}
+
+const ev = parseFloat(params.get("ev"));
+const EV = isFinite(ev) ? ev : 0.60;
+const fr = parseFloat(params.get("frame"));
+const FRAME = isFinite(fr) ? fr : 2.4;
+
+function resize() {
+  let w, h;
+  if (PX) {
+    // Fixed tiny buffer, stretched to fill. Aspect is preserved so the mark
+    // is not squashed -- the pixels are square, just large.
+    h = PX;
+    w = Math.max(1, Math.round(PX * canvas.clientWidth / canvas.clientHeight));
+  } else {
+    const dpr = Math.min(devicePixelRatio || 1, 2) * LADDER[rung].scale;
+    w = Math.max(1, Math.round(canvas.clientWidth  * dpr));
+    h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  }
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+
+let look = { x: 0, y: 0 }, drag = null;
+function pt(e) { const t = e.touches ? e.touches[0] : e; return { x: t.clientX, y: t.clientY }; }
+function down(e) { drag = pt(e); canvas.classList.add("drag"); }
+function move(e) {
+  if (!drag) return;
+  const p = pt(e);
+  look.x += (p.x - drag.x) * 0.006;
+  look.y = Math.max(-0.9, Math.min(0.9, look.y + (p.y - drag.y) * 0.004));
+  drag = p;
+  e.preventDefault();
+}
+function up() { drag = null; canvas.classList.remove("drag"); }
+canvas.addEventListener("mousedown", down);
+addEventListener("mousemove", move);
+addEventListener("mouseup", up);
+canvas.addEventListener("touchstart", down, { passive: true });
+canvas.addEventListener("touchmove", move, { passive: false });
+canvas.addEventListener("touchend", up);
+
+let running = true, raf = 0, frames = 0, lastHud = 0;
+let prev = 0, ema = 1000 / TARGET_FPS, lastAdjust = 0, settled = false;
+const t0 = performance.now();
+
+function frame(now) {
+  if (!running) return;
+
+  // --- frame-time controller ---------------------------------------------
+  // An exponential moving average, so one hitch (a GC pause, a tab switch)
+  // does not drop the quality. Asymmetric thresholds plus a cooldown give
+  // hysteresis: without it the renderer oscillates between two rungs forever,
+  // which is far more visible than simply running at the lower one.
+  if (prev) {
+    const dt = Math.min(now - prev, 200);     // clamp so a stall is not fatal
+    ema += (dt - ema) * 0.12;
+  }
+  prev = now;
+
+  // Drop fast, climb slowly. Asymmetric cooldowns mean a struggling GPU
+  // reaches a playable rung in well under a second, while a borderline one
+  // does not keep stepping back up into stutter.
+  const budget = 1000 / TARGET_FPS;
+  if (adaptive) {
+    if (ema > budget * 1.30 && rung > 0 && now - lastAdjust > 320) {
+      rung--; lastAdjust = now; settled = false;
+    } else if (ema < budget * 0.78 && rung < LADDER.length - 1 && now - lastAdjust > 1600) {
+      rung++; lastAdjust = now;
+    } else if (now - lastAdjust > 1600) {
+      settled = true;
+    }
+  }
+
+  const rec = useRung(rung);
+  resize();
+
+  gl.uniform2f(rec.U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(rec.U.uTime, (now - t0) / 1000);
+  gl.uniform2f(rec.U.uLook, look.x, look.y);
+  gl.uniform1f(rec.U.uExposure, EV);
+  gl.uniform1f(rec.U.uFrame, FRAME);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  frames++;
+  if (now - lastHud > 500) {
+    const L = LADDER[rung];
+    const fps = frames / ((now - lastHud) / 1000);
+    const mode = PX ? `pixelated ${canvas.width}x${canvas.height}`
+               : adaptive ? (settled ? "adaptive: settled" : "adaptive: tuning")
+               : "pinned";
+    hud.textContent =
+      `${fps.toFixed(0)} fps  ·  ${PX ? "" : `rung ${rung}/${LADDER.length - 1}  `}` +
+      `AA ${L.AA}x${L.AA}` +
+      `${PX ? "" : ` @ ${L.scale.toFixed(2)}  ${canvas.width}x${canvas.height}`}` +
+      `  ·  ${mode}` +
+      `  ·  ?px=  ?q=low|medium|high|ultra  ?fps=  ?ev=  ?frame=`;
+    frames = 0; lastHud = now;
+  }
+  raf = requestAnimationFrame(frame);
+}
+if (ok) raf = requestAnimationFrame(frame);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { running = false; cancelAnimationFrame(raf); }
+  else if (ok) {
+    running = true;
+    lastHud = performance.now(); frames = 0;
+    prev = 0; ema = 1000 / TARGET_FPS;   // don't judge quality on the resume frame
+    raf = requestAnimationFrame(frame);
+  }
+});
+addEventListener("resize", resize);
+
+// iOS Safari throws WebGL contexts away under memory pressure, and after a
+// long spell in the background. Without this you come back to a frozen canvas.
+// Every program, shader and buffer dies with the context, so rebuilding in
+// place means re-running all of init -- reloading is shorter and certain, and
+// this page is a few KB.
+canvas.addEventListener("webglcontextlost", e => {
+  e.preventDefault();
+  running = false;
+  cancelAnimationFrame(raf);
+  setTimeout(() => location.reload(), 350);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>inv.no</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <div id="stage">
+    <pre class="ch" id="ch-r"></pre>
+    <pre class="ch" id="ch-g"></pre>
+    <pre class="ch" id="ch-b"></pre>
+  </div>
+
+  <noscript>
+    <pre class="fallback" id="fallback">
+~~~~~=====~ ==== ====    ++=       ++++*+  ***     ******
+~~~~~=====~ ==== ====    ++=       ++++*+  **+    ********
+~~~~~======~==== ===== +=++=       ++++**+ **+  *****  *****
+~~~~~===~==~====  ==== +++=        +++ +*+ **+  ***      ***
+~~~~~===~==~====  ==== +++=        +++ +*+ **+  ***      ***
+~~~~~===~ ======    =++++=         +++  **+**+  ***      ***
+~~~~~===~   ====    =+++=     +++  +++  **+**+  *****+ *****
+~~~~~===~   ===~     =+=      +++  +++     **+    ********
+                                                      **
+    </pre>
+  </noscript>
+
+<script src="../font.js"></script>
+<script>
+const DEPTH = 3;                      // extrusion layers each way
+const RAMP  = "@#%x*+=~:-. ";
+
+// press C to cycle faces; ?case=upper|worm|lower in the URL also works
+const FACE_ORDER = ["upper", "worm", "lower"];
+const requested = new URLSearchParams(location.search).get("case");
+let face = FACE_ORDER.includes(requested) ? requested : FACE_ORDER[0];
+let geom = buildPoints(face, DEPTH);
+let pts  = geom.pts;
+
+const H = 22;             // character rows
+const FOV = 90;
+let SY = 1.15;            // from the face, so all faces occupy the same height
+let W = 150, SX = 2.4;    // columns and x-scale — recomputed to fit the viewport
+let fsPx = 13;            // cached font size, so the frame loop never reads style
+let chars, zbuf;          // render buffers, reused every frame to avoid GC churn
+
+const chR = document.getElementById("ch-r");
+const chG = document.getElementById("ch-g");
+const chB = document.getElementById("ch-b");
+
+// Pick a legible font size, measure the real character advance, then derive how
+// many columns actually fit. Guessing the advance from font-size is what makes
+// the grid overflow on narrow screens.
+function fit() {
+  // visualViewport is the honest width on iOS once the toolbars are involved
+  const vw = Math.round((window.visualViewport && visualViewport.width) || innerWidth);
+
+  fsPx = Math.max(6, Math.min(13, vw / 48));
+  document.documentElement.style.setProperty("--fs", fsPx + "px");
+
+  const probe = document.createElement("pre");
+  probe.className = "ch";
+  probe.style.cssText = "position:absolute;visibility:hidden;mix-blend-mode:normal";
+  probe.textContent = "0".repeat(100);
+  document.body.appendChild(probe);
+  const advance = probe.getBoundingClientRect().width / 100;
+  probe.remove();
+
+  // if the probe measured nothing (font not ready yet) fall back to a
+  // conservative 0.62em advance rather than dividing by zero
+  const adv = advance > 0 ? advance : fsPx * 0.62;
+
+  W = Math.max(60, Math.min(150, Math.floor((vw - 2) / adv)));
+  // baseSX/baseSY hold the on-screen span constant across faces, so switching
+  // doesn't change how large the banner sits — the worm is 14 rows tall
+  // against the other faces' 10
+  SX = (W / 150) * geom.baseSX;
+  SY = geom.baseSY;
+
+  chars = new Array(W * H);
+  zbuf  = new Array(W * H);
+}
+
+// `disp` is the lens-dispersion factor: each colour channel focuses slightly
+// differently, so red projects a touch wider than blue. The divergence is nil
+// at the centre and grows toward the edges, like a real lens.
+function render(angle, disp) {
+  const sin = Math.sin(angle), cos = Math.cos(angle);
+  chars.fill(" ");
+  zbuf.fill(-Infinity);
+
+  for (const p of pts) {
+    const rx = p.x * cos + p.z * sin;
+    const rz = -p.x * sin + p.z * cos;
+    const tilt = Math.sin(angle * 0.5) * 0.22;
+    const ry = p.y * Math.cos(tilt) - rz * Math.sin(tilt);
+    const rz2 = p.y * Math.sin(tilt) + rz * Math.cos(tilt);
+
+    const f = FOV / (FOV + rz2 + 25);
+    const sx = Math.round(rx * SX * disp * f + W / 2);
+    const sy = Math.round(ry * SY * disp * f + H / 2);
+    if (sx < 0 || sx >= W || sy < 0 || sy >= H) continue;
+
+    const i = sy * W + sx;
+    if (-rz2 > zbuf[i]) {           // nearer wins
+      zbuf[i] = -rz2;
+      const t = (rz2 + 22) / 44;    // depth 0..1, 0 = nearest
+      chars[i] = RAMP[Math.max(0, Math.min(RAMP.length - 1, Math.round(t * (RAMP.length - 1))))];
+    }
+  }
+
+  // every row is padded to exactly W chars so all three channels have
+  // identical box widths — without this they drift apart
+  let out = "";
+  for (let y = 0; y < H; y++) out += chars.slice(y * W, y * W + W).join("") + "\n";
+  return out;
+}
+
+let angle = 0, speed = 0.016, paused = false;
+
+function frame() {
+  // pulse the aberration so it breathes instead of sitting static
+  const a = 0.034 + Math.sin(angle * 0.7) * 0.020;
+  // temporal split: red trails the rotation, blue leads it. The channels
+  // disagree about where the object *is*, not just how wide it projects,
+  // so the fringing swells as the banner turns.
+  const lag = 0.085 + Math.sin(angle * 0.9) * 0.040;
+
+  chR.textContent = render(angle - lag, 1 + a);
+  chG.textContent = render(angle,       1);
+  chB.textContent = render(angle + lag, 1 - a);
+
+  // lateral split, opposite for r and b, with a slight vertical shear.
+  // scaled off the cached font size — reading computed style here would force
+  // a style recalc on every frame, which is expensive on mobile
+  const px = a * 170 * (fsPx / 13);
+  chR.style.transform = `translate(${ px.toFixed(2) }px, ${ (-px * 0.18).toFixed(2) }px)`;
+  chB.style.transform = `translate(${ (-px).toFixed(2) }px, ${ (px * 0.18).toFixed(2) }px)`;
+
+  if (!paused) angle += speed;
+  requestAnimationFrame(frame);
+}
+
+fit();
+frame();
+
+let resizeTimer;
+function scheduleFit() {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(fit, 120);
+}
+addEventListener("resize", scheduleFit);
+// iOS does not always fire resize on rotation, and fires it before the new
+// viewport is settled when it does
+addEventListener("orientationchange", () => setTimeout(fit, 250));
+if (window.visualViewport) visualViewport.addEventListener("resize", scheduleFit);
+// re-measure once webfonts/metrics settle, in case the first probe was early
+addEventListener("load", () => setTimeout(fit, 50));
+
+addEventListener("click", () => { paused = !paused; });
+addEventListener("keydown", e => {
+  if (e.key === "ArrowRight") speed += 0.006;
+  if (e.key === "ArrowLeft")  speed -= 0.006;
+  if (e.key === "c" || e.key === "C") {
+    face = FACE_ORDER[(FACE_ORDER.indexOf(face) + 1) % FACE_ORDER.length];
+    geom = buildPoints(face, DEPTH);
+    pts  = geom.pts;
+    fit();
+  }
+});
+</script>
+</body>
+</html>
