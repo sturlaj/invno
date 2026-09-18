@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inv.no — amber crt</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100dvh; cursor: grab; touch-action: none; }
+  canvas.drag { cursor: grabbing; }
+  #err {
+    position: fixed; inset: 0; margin: 0; padding: 1rem;
+    font: 11px/1.45 ui-monospace, Consolas, monospace;
+    color: #ff6b8a; background: #0a0306; white-space: pre-wrap;
+    overflow: auto; display: none;
+  }
+  #hud {
+    position: fixed; left: 10px; bottom: 8px;
+    font: 10px/1.5 ui-monospace, Consolas, monospace;
+    color: #6b4a18; opacity: .8; pointer-events: none; display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<pre id="err"></pre>
+<div id="hud"></div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+
+<!-- ===================================================================== -->
+<!-- PASS 1 -- draw the mark as a monochrome brightness signal, the way a   -->
+<!-- single-gun tube would receive it. No colour, no gloss: just beam       -->
+<!-- intensity, which the post pass turns into phosphor.                    -->
+<!-- ===================================================================== -->
+<script id="fs-scene" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec2  uLook;
+uniform float uFrame;
+
+#define PI 3.141592653589793
+
+const float THICK = 0.150;
+const float ROUND = 0.012;
+const float FOVF  = 1.05;
+const vec2  HALF  = vec2(2.498, 0.736);
+const vec3  LIGHT = vec3(-0.42, 0.68, -0.60);
+
+__WORDMARK__
+
+// ---------------------------------------------------------------------------
+// Ordered dithering. A single-gun monochrome tube has no grey -- a pixel is
+// lit or it is not -- so shading was faked with a threshold pattern. Bayer is
+// the right one: it is the matrix that spreads thresholds as evenly as
+// possible, which is why it reads as texture rather than as noise.
+//
+// Built by recursion rather than a lookup table, since GLSL ES 1.00 cannot
+// index a const array with a computed index. B2(x,y) = (2x + 3y) mod 4 happens
+// to generate the 2x2 base case exactly.
+// ---------------------------------------------------------------------------
+float bayer2(vec2 p) { return mod(2.0 * p.x + 3.0 * p.y, 4.0); }
+
+float bayer4(vec2 c) {
+  vec2 p = floor(mod(c, 4.0));
+  return (4.0 * bayer2(floor(p * 0.5)) + bayer2(mod(p, 2.0))) / 16.0;
+}
+
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+
+float sdModel(vec3 p) {
+  float spin = uTime * 0.30 + uLook.x;
+  p.xz = rot(spin)   * p.xz;
+  p.yz = rot(uLook.y) * p.yz;
+  float d2 = sdWord(p.xy + vec2(2.355, 0.739));
+  vec2  w  = vec2(d2, abs(p.z) - THICK);
+  return min(max(w.x, w.y), 0.0) + length(max(w, 0.0)) - ROUND;
+}
+
+vec3 normalAt(vec3 p) {
+  const vec2 k = vec2(1.0, -1.0);
+  float e = 0.0020;
+  return normalize(k.xyy * sdModel(p + k.xyy * e)
+                 + k.yyx * sdModel(p + k.yyx * e)
+                 + k.yxy * sdModel(p + k.yxy * e)
+                 + k.xxx * sdModel(p + k.xxx * e));
+}
+
+// ---------------------------------------------------------------------------
+// Flat shading. An extrusion only really has three kinds of surface: the front
+// face, the back face, and the wall around the edge. Smooth normals blur those
+// together across the fillet, which is what made it look moulded rather than
+// machined.
+//
+// So: collapse anything facing the camera to a single flat normal, and quantise
+// the wall direction into FACETS sectors. The front face becomes one uniform
+// tone and the wall steps in discrete bands -- flat shading, and with the
+// dither on top it reads like something drawn by a machine that only had one
+// brightness to work with.
+// ---------------------------------------------------------------------------
+vec3 flatten(vec3 n) {
+  if (abs(n.z) > 0.5) return vec3(0.0, 0.0, n.z > 0.0 ? 1.0 : -1.0);
+  float sector = 6.2831853 / FACETS;
+  float a = floor(atan(n.y, n.x) / sector + 0.5) * sector;
+  return vec3(cos(a), sin(a), 0.0);
+}
+
+const float BOUND = 2.72;
+
+bool hitBound(vec3 ro, vec3 rd, out float t0, out float t1) {
+  float b = dot(ro, rd);
+  float c = dot(ro, ro) - BOUND * BOUND;
+  float h = b * b - c;
+  if (h < 0.0) return false;
+  h = sqrt(h);
+  t0 = -b - h; t1 = -b + h;
+  return t1 > 0.0;
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+
+  float aspect = uRes.x / uRes.y;
+  float dist = max(max(HALF.x * uFrame / (0.5 * aspect * FOVF),
+                       HALF.y * uFrame / (0.5 * FOVF)), 3.25) + 0.75;
+
+  vec3 ro = vec3(0.0, 0.0, -dist);
+  vec3 rd = normalize(vec3(uv * FOVF, 1.0));
+
+  float sig = 0.0;
+  float t0, t1;
+  if (hitBound(ro, rd, t0, t1)) {
+    float t = max(t0, 0.0);
+    bool hit = false;
+    for (int i = 0; i < STEPS; i++) {
+      float d = sdModel(ro + rd * t);
+      if (d < 0.0009 * t + 0.0005) { hit = true; break; }
+      t += d * 0.92;
+      if (t > t1) break;
+    }
+    if (hit) {
+      vec3 p = ro + rd * t;
+      vec3 n = flatten(normalAt(p));
+      vec3 L = normalize(LIGHT);
+
+      float diff = max(dot(n, L), 0.0);
+      sig = 0.085 + 0.78 * diff;
+
+      // No rim and no specular: both are smooth functions of the view angle,
+      // so on flat facets they would only add a gradient back in. The form has
+      // to read from the tone steps between facets alone.
+
+      // Quantise to LEVELS through the dither matrix. At LEVELS=2 this is
+      // true 1-bit: every pixel is fully on or fully off, and all the tone
+      // comes from the pattern. The bloom pass then smears it, which is what
+      // phosphor actually did to dithered output.
+      float steps = max(LEVELS - 1.0, 1.0);
+      sig = clamp(floor(sig * steps + bayer4(gl_FragCoord.xy)) / steps, 0.0, 1.0);
+    }
+  }
+
+  gl_FragColor = vec4(sig, sig, sig, 1.0);
+}
+</script>
+
+
+<!-- ===================================================================== -->
+<!-- PASS 2 -- phosphor bloom, at signal resolution. Cheap here; the same    -->
+<!-- taps at display resolution would be ~150M texture fetches a frame at    -->
+<!-- 1080p instead of ~10M.                                                  -->
+<!-- ===================================================================== -->
+<script id="fs-bloom" type="x-shader/x-fragment">
+precision highp float;
+
+uniform sampler2D uTex;
+uniform vec2 uRes;        // this buffer -- half the signal
+uniform vec2 uTexSize;    // the signal buffer
+
+// Golden-angle spiral: better coverage per tap than a box or a cross, and taps
+// are the entire cost. Two radii in one pass -- a tight halo hugging the
+// strokes, and a wide haze that lifts the whole tube.
+float spiral(vec2 uv, float radius) {
+  float s = 0.0, w = 0.0;
+  for (int i = 0; i < BLOOM_TAPS; i++) {
+    float a = float(i) * 2.3999632;
+    float r = sqrt((float(i) + 0.5) / float(BLOOM_TAPS));
+    vec2  o = vec2(cos(a), sin(a)) * r * radius / uTexSize;
+    float wt = exp(-r * r * 1.6);
+    s += texture2D(uTex, uv + o).r * wt;
+    w += wt;
+  }
+  return s / w;
+}
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float g = spiral(uv, 9.0) + spiral(uv, 3.0) * 0.80;
+  gl_FragColor = vec4(g, g, g, 1.0);
+}
+</script>
+
+
+<!-- ===================================================================== -->
+<!-- PASS 3 -- the tube. Barrel curvature, scanlines, amber tint, mains      -->
+<!-- flicker, beam noise. No vignette.                                      -->
+<!-- ===================================================================== -->
+<script id="fs-crt" type="x-shader/x-fragment">
+precision highp float;
+
+uniform sampler2D uTex;        // signal
+uniform sampler2D uBloomTex;   // pre-blurred signal
+uniform vec2  uRes;       // screen
+uniform float uTime;
+uniform float uCurve;
+uniform float uScan;
+uniform float uLines;
+uniform float uBloom;
+uniform float uExposure;
+
+#define PI 3.141592653589793
+
+// P3 amber phosphor. Not orange: amber sits closer to 590nm, so green is a
+// little over half of red and blue is almost absent.
+const vec3 AMBER = vec3(1.000, 0.620, 0.105);
+const vec3 HOT   = vec3(1.000, 0.900, 0.640);   // where the beam saturates
+
+float hash12(vec2 p) {
+  vec3 q = fract(vec3(p.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.x + q.y) * q.z);
+}
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+
+  // ---- tube geometry ----------------------------------------------------
+  // Barrel distortion about the centre. Deliberately gentle: enough that
+  // straight scanlines bow, not enough to read as a fisheye.
+  vec2 c  = uv * 2.0 - 1.0;
+  float r2 = dot(c, c);
+  vec2 d  = c * (1.0 + uCurve * r2);
+
+  // horizontal sync instability -- a slow drift plus a faint per-line shear
+  d.x += sin(uTime * 0.63) * 0.0016
+       + sin(d.y * 74.0 + uTime * 5.1) * 0.0007;
+
+  vec2 suv = d * 0.5 + 0.5;
+
+  // outside the glass
+  if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
+    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+
+  // ---- signal -----------------------------------------------------------
+  float sig  = texture2D(uTex, suv).r;
+  float glow = texture2D(uBloomTex, suv).r;   // blurred in pass 2
+  float lum  = sig + glow * uBloom;
+
+  // ---- scanlines --------------------------------------------------------
+  // Multiplicative, deliberately: a scanline is a gap in the beam's path, not
+  // a dark line painted over the picture. Where nothing is drawn there is no
+  // beam to interrupt, so the lines simply are not there -- which is how it
+  // looked, and why the raster only showed up on lit areas.
+  //
+  // uLines is independent of the signal resolution, so the lines can be made
+  // fat without also coarsening the image behind them. Drifts slowly, like a
+  // tube that never quite locks.
+  float line = suv.y * uLines + uTime * 0.35;
+  float sl = 1.0 - uScan * (0.5 + 0.5 * cos(line * 2.0 * PI));
+  lum *= sl;
+
+  // beam gets slightly wider where it is brighter, so bright lines bleed into
+  // their neighbours instead of being cut by the mask
+  lum *= mix(1.0, 1.18, smoothstep(0.35, 1.2, sig));
+
+  // ---- mains hum and beam noise -----------------------------------------
+  // Both are modulations OF the beam, so they scale with it. Adding noise as
+  // a constant would lift the black floor across the whole tube, and a CRT's
+  // black is the absence of emission -- there is nothing there to be noisy.
+  lum *= 0.975 + 0.025 * sin(uTime * 96.0 + suv.y * 3.0);
+  lum += (hash12(gl_FragCoord.xy + fract(uTime) * 137.0) - 0.5) * 0.05 * lum;
+
+  // ---- phosphor ---------------------------------------------------------
+  // No black lift. Unlit phosphor emits nothing, and a tube switches off its
+  // beam completely -- which is exactly why CRTs had contrast an LCD could
+  // not touch. Everything that is not drawn stays at zero.
+  lum = max(lum, 0.0) * uExposure;
+  vec3 col = AMBER * lum;
+  col = mix(col, HOT, smoothstep(0.85, 2.2, lum) * 0.75);   // beam saturation
+
+  // ---- glass ------------------------------------------------------------
+  // No vignette. Only a narrow darkening right at the glass, so the tube has
+  // an edge rather than a gradient creeping into the picture.
+  vec2 e = abs(d);
+  float edge = (1.0 - smoothstep(0.988, 1.0, e.x)) * (1.0 - smoothstep(0.988, 1.0, e.y));
+  col *= mix(0.55, 1.0, edge);
+
+  col = col / (col + 0.90);                 // roll off, do not clip
+  col = pow(col, vec3(0.4545));
+  col += (hash12(gl_FragCoord.xy * 1.7 + fract(uTime) * 53.0) - 0.5) / 255.0;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script src="../wordmark.js"></script>
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hud    = document.getElementById("hud");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  canvas.style.display = "none";
+  hud.style.display = "none";
+}
+
+const gl = canvas.getContext("webgl", { antialias: false, alpha: false, depth: false, powerPreference: "high-performance" })
+        || canvas.getContext("experimental-webgl");
+if (!gl) fail("WebGL is not available in this browser.");
+
+const params = new URLSearchParams(location.search);
+if (params.has("hud")) hud.style.display = "block";
+const mobile = matchMedia("(pointer: coarse)").matches;
+
+function num(name, dflt) {
+  const v = parseFloat(params.get(name));
+  return isFinite(v) ? v : dflt;
+}
+
+// The signal buffer IS the tube's resolution -- scanline count and the softness
+// of everything follow from it. A real amber terminal was around 200-400 lines.
+const LINES  = Math.max(48, Math.min(900, Math.round(num("px", mobile ? 220 : 300))));
+const STEPS  = Math.round(num("steps", mobile ? 56 : 80));
+const TAPS   = Math.round(num("taps",  mobile ? 10 : 16));
+
+const LEVELS = Math.max(2, Math.round(num("levels", 2)));
+const FACETS = Math.max(3, Math.round(num("facets", 14)));
+const SCANLN = Math.max(8, Math.round(num("lines", mobile ? 90 : 130)));
+const CURVE  = num("curve",  0.055);
+const SCAN   = num("scan",   0.42);
+const BLOOM  = num("bloom",  0.85);
+const EV     = num("ev",     1.0);
+const FRAME  = num("frame",  2.4);
+
+function compile(type, src, label) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    const numbered = src.split("\n").map((l, i) => String(i + 1).padStart(4) + " | " + l).join("\n");
+    throw new Error(label + " failed to compile:\n\n" + log + "\n\n" + numbered);
+  }
+  return s;
+}
+
+function link(vs, fsSrc, label, uniforms) {
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc, label));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error(label + " failed to link:\n\n" + gl.getProgramInfoLog(p));
+  const U = {};
+  for (const k of uniforms) U[k] = gl.getUniformLocation(p, k);
+  return { prog: p, U, aPos: gl.getAttribLocation(p, "aPos") };
+}
+
+let scene, bloom, crt, quad, sig, blm, ok = false;
+
+// LINEAR so bloom taps interpolate between rows -- with NEAREST the glow comes
+// out blocky rather than soft. CLAMP_TO_EDGE so a tap landing outside does not
+// wrap round to the opposite side of the screen.
+function makeTarget() {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return { tex, fbo: gl.createFramebuffer(), w: 0, h: 0 };
+}
+
+function sizeTarget(tg, w, h) {
+  if (tg.w === w && tg.h === h) return;
+  tg.w = w; tg.h = h;
+  gl.bindTexture(gl.TEXTURE_2D, tg.tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, tg.fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tg.tex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE)
+    fail("framebuffer incomplete at " + w + "x" + h);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+try {
+  const vs = compile(gl.VERTEX_SHADER, document.getElementById("vs").textContent, "vertex");
+
+  const sceneSrc = `#define STEPS ${STEPS}\n#define LEVELS ${LEVELS}.0\n#define FACETS ${FACETS}.0\n`
+    + document.getElementById("fs-scene").textContent.replace("__WORDMARK__", WORDMARK_GLSL);
+  scene = link(vs, sceneSrc, "scene shader", ["uRes", "uTime", "uLook", "uFrame"]);
+
+  const bloomSrc = `#define BLOOM_TAPS ${TAPS}\n` + document.getElementById("fs-bloom").textContent;
+  bloom = link(vs, bloomSrc, "bloom shader", ["uTex", "uRes", "uTexSize"]);
+
+  crt = link(vs, document.getElementById("fs-crt").textContent, "crt shader",
+    ["uTex", "uBloomTex", "uRes", "uTime", "uCurve", "uScan", "uLines", "uBloom", "uExposure"]);
+
+  quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+
+  sig = makeTarget();     // the beam signal, at tube resolution
+  blm = makeTarget();     // its blur, at half of that again
+  ok = true;
+} catch (e) {
+  fail(String(e.message || e));
+}
+
+function resize() {
+  // The tube is drawn at display resolution so curvature and scanlines stay
+  // crisp; only the signal behind it is low-res.
+  const dpr = Math.min(devicePixelRatio || 1, mobile ? 2 : 1.5);
+  const w = Math.max(1, Math.round(canvas.clientWidth  * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+
+  const sw = Math.max(1, Math.round(LINES * w / h));
+  sizeTarget(sig, sw, LINES);
+  sizeTarget(blm, Math.max(1, sw >> 1), Math.max(1, LINES >> 1));
+}
+
+let look = { x: 0, y: 0 }, drag = null;
+function pt(e) { const t = e.touches ? e.touches[0] : e; return { x: t.clientX, y: t.clientY }; }
+function down(e) { drag = pt(e); canvas.classList.add("drag"); }
+function move(e) {
+  if (!drag) return;
+  const p = pt(e);
+  look.x += (p.x - drag.x) * 0.006;
+  look.y = Math.max(-0.9, Math.min(0.9, look.y + (p.y - drag.y) * 0.004));
+  drag = p;
+  e.preventDefault();
+}
+function up() { drag = null; canvas.classList.remove("drag"); }
+canvas.addEventListener("mousedown", down);
+addEventListener("mousemove", move);
+addEventListener("mouseup", up);
+canvas.addEventListener("touchstart", down, { passive: true });
+canvas.addEventListener("touchmove", move, { passive: false });
+canvas.addEventListener("touchend", up);
+
+function bindQuad(rec) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.enableVertexAttribArray(rec.aPos);
+  gl.vertexAttribPointer(rec.aPos, 2, gl.FLOAT, false, 0, 0);
+}
+
+let running = true, raf = 0, frames = 0, lastHud = 0;
+const t0 = performance.now();
+
+function frame(now) {
+  if (!running) return;
+  resize();
+  const t = (now - t0) / 1000;
+
+  // --- pass 1: beam signal, at tube resolution ---
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sig.fbo);
+  gl.viewport(0, 0, sig.w, sig.h);
+  gl.useProgram(scene.prog);
+  bindQuad(scene);
+  gl.uniform2f(scene.U.uRes, sig.w, sig.h);
+  gl.uniform1f(scene.U.uTime, t);
+  gl.uniform2f(scene.U.uLook, look.x, look.y);
+  gl.uniform1f(scene.U.uFrame, FRAME);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // --- pass 2: blur it, at half that again ---
+  gl.bindFramebuffer(gl.FRAMEBUFFER, blm.fbo);
+  gl.viewport(0, 0, blm.w, blm.h);
+  gl.useProgram(bloom.prog);
+  bindQuad(bloom);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, sig.tex);
+  gl.uniform1i(bloom.U.uTex, 0);
+  gl.uniform2f(bloom.U.uRes, blm.w, blm.h);
+  gl.uniform2f(bloom.U.uTexSize, sig.w, sig.h);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // --- pass 3: the tube, at display resolution ---
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(crt.prog);
+  bindQuad(crt);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, sig.tex);
+  gl.uniform1i(crt.U.uTex, 0);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, blm.tex);
+  gl.uniform1i(crt.U.uBloomTex, 1);
+  gl.uniform2f(crt.U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(crt.U.uTime, t);
+  gl.uniform1f(crt.U.uCurve, CURVE);
+  gl.uniform1f(crt.U.uScan, SCAN);
+  gl.uniform1f(crt.U.uLines, SCANLN);
+  gl.uniform1f(crt.U.uBloom, BLOOM);
+  gl.uniform1f(crt.U.uExposure, EV);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  frames++;
+  if (now - lastHud > 500) {
+    hud.textContent =
+      `${(frames / ((now - lastHud) / 1000)).toFixed(0)} fps` +
+      `  ·  signal ${sig.w}x${sig.h}  bloom ${blm.w}x${blm.h}  tube ${canvas.width}x${canvas.height}` +
+      `  ·  ${SCANLN} scanlines, ${LEVELS}-level dither, ${TAPS} taps` +
+      `  ·  ?px= ?lines= ?levels= ?curve= ?scan= ?bloom= ?ev= ?frame=`;
+    frames = 0; lastHud = now;
+  }
+  raf = requestAnimationFrame(frame);
+}
+if (ok) raf = requestAnimationFrame(frame);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { running = false; cancelAnimationFrame(raf); }
+  else if (ok) { running = true; lastHud = performance.now(); frames = 0; raf = requestAnimationFrame(frame); }
+});
+addEventListener("resize", resize);
+
+// iOS Safari discards WebGL contexts under memory pressure; the FBO and both
+// programs die with it, so reloading is shorter and surer than rebuilding.
+canvas.addEventListener("webglcontextlost", e => {
+  e.preventDefault();
+  running = false;
+  cancelAnimationFrame(raf);
+  setTimeout(() => location.reload(), 350);
+});
+</script>
+</body>
+</html>

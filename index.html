@@ -40,10 +40,10 @@
 // launcher picks one per visit by weight.
 //
 // Weights are relative, not percentages, so adding an experiment does not mean
-// recalculating the others. Currently: spinner 25%, ascii 75%.
+// recalculating the others. Equal weights here means an even split.
 const EXPERIMENTS = [
-  { name: "ascii",   src: "experiments/ascii.html",   weight: 75 },
-  { name: "spinner", src: "experiments/spinner.html", weight: 25 },
+  { name: "ascii",    src: "experiments/ascii.html",    weight: 50 },
+  { name: "monolith", src: "experiments/monolith.html", weight: 50 },
 ];
 
 const params = new URLSearchParams(location.search);
@@ -66,7 +66,7 @@ function pick() {
 
 const chosen = pick();
 
-// Forward the query string through, so ?x=spinner&ev=0.4&px=140 reaches the
+// Forward the query string through, so ?x=monolith&hud=1&q=medium reaches the
 // experiment and its own knobs keep working from the top-level URL.
 const forward = new URLSearchParams(params);
 forward.delete("x");

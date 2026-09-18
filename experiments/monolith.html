@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inv.no — monolith</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100dvh; cursor: grab; touch-action: none; }
+  canvas.drag { cursor: grabbing; }
+  #err {
+    position: fixed; inset: 0; margin: 0; padding: 1rem;
+    font: 11px/1.45 ui-monospace, Consolas, monospace;
+    color: #ff6b8a; background: #0a0306; white-space: pre-wrap;
+    overflow: auto; display: none;
+  }
+  #hud {
+    position: fixed; left: 10px; bottom: 8px;
+    font: 10px/1.5 ui-monospace, Consolas, monospace;
+    color: #46525c; opacity: .8; pointer-events: none; display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<pre id="err"></pre>
+<div id="hud"></div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec3  uCam;        // yaw, pitch, distance -- absolute, set from JS
+uniform float uExposure;
+
+// Lattice, all live so it can be tuned without a recompile.
+uniform vec2  uLatAng;     // yaw, pitch -- the angle of attack
+uniform vec4  uLatCell;    // cell x, y, z (glyph units) and the glyph scale
+uniform vec3  uLatMot;     // drift z, drift x, block half-depth
+uniform float uLatT;       // lattice clock, advanced by JS so it can be paused
+
+#define PI 3.141592653589793
+
+// ---- the slab ----
+// Fills ~56% of screen height at the default camera (?cam=0.695,0.428,6.04).
+const float SLAB_W = 1.95;
+const float SLAB_H = 2.20;
+const float SLAB_D = 0.34;
+const float SLAB_R = 0.008;          // corner fillet, just enough to catch light
+
+// ---- the lattice ----
+// Defaults live in the JS now (see LAT_DEFAULT) so they can be tuned live.
+// The one constraint to keep in mind while tuning: a block crossing at angle t
+// must be deeper than SLAB_D / cos(t), or the letters never open all the way
+// through and read as dents rather than holes. The readout checks this.
+const vec2  INV_C   = vec2(1.115, 0.500);        // measured centre of sdINV
+
+const vec3 KEY  = vec3(-0.35, 0.72, -0.60);
+const vec3 KEYC = vec3(1.00, 0.97, 0.92);
+const float KEYI = 2.4;
+
+// Aluminium: high, almost neutral reflectance, no diffuse at all. Roughness is
+// well up from a polished 0.30 -- satin rather than mirror. Gloss that sharp
+// reflects the strip lights at a higher spatial frequency than the geometry can
+// represent, which is where the aliasing came from.
+const vec3  ALU   = vec3(0.912, 0.914, 0.920);
+const float ALU_R = 0.55;
+
+__GLYPHS__
+
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+
+float sdBox3(vec3 p, vec3 b, float r) {
+  vec3 q = abs(p) - b + r;
+  return min(max(q.x, max(q.y, q.z)), 0.0) + length(max(q, 0.0)) - r;
+}
+
+// ---------------------------------------------------------------------------
+// The lattice. Infinite 3D grid of extruded INV blocks, never drawn -- it only
+// exists to be subtracted from the slab.
+//
+// Note the return value is scaled back up by GSCALE. Dividing the query point
+// by a factor shrinks the distance field by the same factor, so without that
+// multiply the marcher would be told every distance is 3x shorter than it is
+// and crawl.
+// ---------------------------------------------------------------------------
+float sdLattice(vec3 p) {
+  float gscale = uLatCell.w;
+  vec3  cell   = uLatCell.xyz;
+
+  p.xz = rot(uLatAng.x) * p.xz;
+  p.yz = rot(uLatAng.y) * p.yz;
+
+  vec3 q = p / gscale;
+  q.x -= uLatT * uLatMot.y;
+  q.z -= uLatT * uLatMot.x;
+
+  // Running bond: shift every other row half a cell across, so the blocks do
+  // not line up into vertical columns. The row index has to be taken from the
+  // unshifted q.y -- computing it after the shift would make the offset depend
+  // on itself.
+  float row = floor(q.y / cell.y);
+  q.x += mod(row, 2.0) * 0.5 * cell.x;
+
+  // one block per cell, centred in it
+  vec3 r = mod(q, cell) - 0.5 * cell;
+
+  float d2 = sdINV(r.xy + INV_C);
+  vec2  w  = vec2(d2, abs(r.z) - uLatMot.z);
+  return (min(max(w.x, w.y), 0.0) + length(max(w, 0.0))) * gscale;
+}
+
+float sdSlab(vec3 p) {
+  return sdBox3(p - vec3(0.0, SLAB_H * 0.5, 0.0),
+                vec3(SLAB_W * 0.5, SLAB_H * 0.5, SLAB_D * 0.5), SLAB_R);
+}
+
+// ---------------------------------------------------------------------------
+// The carved slab, with the lattice skipped whenever it cannot possibly matter.
+//
+// Subtraction is max(slab, -lattice), so wherever the slab distance is positive
+// the result is >= that distance -- the lattice can only push the surface
+// further away, never nearer. That means for any point outside the slab, the
+// slab distance alone is a correct and safe bound, and the lattice (by far the
+// most expensive thing in the shader) can be skipped entirely.
+//
+// Every carved surface lies where slab <= 0, so nothing is lost. The small
+// margin keeps the letter holes from being missed right at the face.
+// ---------------------------------------------------------------------------
+float carvedD(vec3 p) {
+  float s = sdSlab(p);
+  if (s > 0.02) return s;
+  return max(s, -sdLattice(p));
+}
+
+float mapD(vec3 p) {
+  return min(carvedD(p), p.y);
+}
+
+// Only the slab needs numeric normals. The floor is an exact plane, so its
+// normal is known and four more field evaluations would be wasted.
+vec3 normalSlab(vec3 p) {
+  const vec2 k = vec2(1.0, -1.0);
+  float e = 0.0016;
+  return normalize(k.xyy * carvedD(p + k.xyy * e)
+                 + k.yyx * carvedD(p + k.yyx * e)
+                 + k.yxy * carvedD(p + k.yxy * e)
+                 + k.xxx * carvedD(p + k.xxx * e));
+}
+
+// Slab-method ray/box intersection, used to bound everything: the primary
+// march, and the shadow ray.
+bool boxSpan(vec3 ro, vec3 rd, vec3 c, vec3 b, out float t0, out float t1) {
+  vec3 m = 1.0 / rd;
+  vec3 o = ro - c;
+  vec3 k = abs(m) * b;
+  vec3 tA = -m * o - k;
+  vec3 tB = -m * o + k;
+  t0 = max(max(tA.x, tA.y), tA.z);
+  t1 = min(min(tB.x, tB.y), tB.z);
+  return t1 > max(t0, 0.0);
+}
+
+const vec3 BC = vec3(0.0, SLAB_H * 0.5, 0.0);
+const vec3 BH = vec3(SLAB_W * 0.5 + 0.03, SLAB_H * 0.5 + 0.03, SLAB_D * 0.5 + 0.03);
+
+// ---------------------------------------------------------------------------
+// Everything outside the slab and its patch of floor is unlit. Two soft strips
+// are the whole room -- the aluminium exists visually only as what it reflects.
+// ---------------------------------------------------------------------------
+vec3 env(vec3 d) {
+  vec3 c = vec3(0.0);
+  float top = smoothstep(0.40, 0.03, abs(d.y - 0.78)) * smoothstep(-0.75, 0.25, d.z);
+  c += vec3(0.82, 0.86, 1.00) * 1.75 * top;
+  float side = smoothstep(0.17, 0.01, abs(d.x + 0.82)) * smoothstep(-0.55, 0.45, d.y);
+  c += vec3(0.60, 0.74, 1.00) * 1.05 * side;
+  c += vec3(0.016, 0.018, 0.024) * smoothstep(0.25, -0.9, d.y);   // floor bounce
+  return c;
+}
+
+float ggx(vec3 n, vec3 v, vec3 l, float rough) {
+  float a = max(rough * rough, 1e-4);
+  vec3  h = normalize(v + l);
+  float NoH = max(dot(n, h), 0.0);
+  float NoV = max(dot(n, v), 1e-3);
+  float NoL = max(dot(n, l), 0.0);
+  float dd  = NoH * NoH * (a * a - 1.0) + 1.0;
+  float D   = (a * a) / (PI * dd * dd);
+  float k   = a * 0.5;
+  float G   = (NoL / (NoL * (1.0 - k) + k)) * (NoV / (NoV * (1.0 - k) + k));
+  return D * G / (4.0 * NoV * max(NoL, 1e-3)) * NoL;
+}
+
+// Soft shadow by tracking how close the ray passes to geometry. This is what
+// plants the slab on the floor -- without it the thing floats.
+//
+// Only the slab casts: the floor is a flat plane and the light is above it, so
+// it can never shadow itself. And if the shadow ray misses the slab's bounding
+// box the point is simply lit, which makes shadowing free across the whole
+// floor except in the slab's immediate footprint.
+//
+// `rnd` jitters where the march starts. A fixed start means every pixel in a
+// penumbra samples the occluder at the same set of distances, so the error is
+// identical across neighbours and shows up as hard bands -- the jagged edges.
+// Offsetting per pixel turns that correlated error into noise, which the
+// supersampling then averages. It costs one multiply.
+float shadow(vec3 p, vec3 l, float rnd) {
+  float b0, b1;
+  if (!boxSpan(p, l, BC, BH, b0, b1)) return 1.0;
+  float t = max(b0, 0.025) + rnd * 0.06;
+  float tEnd = min(b1, 14.0);
+  float res = 1.0;
+  for (int i = 0; i < SHADOW_STEPS; i++) {
+    if (t > tEnd) break;
+    float h = carvedD(p + l * t);
+    res = min(res, h / (0.055 * t));
+    t += clamp(h, 0.025, 0.35);
+    if (res < 0.005) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+// Ambient occlusion, and this one earns its place: it is what darkens the
+// inside of each carved letter so INV reads as a recess rather than paint.
+//
+// The probe radii have to stay below the carved stroke width (0.044 world) or
+// the whole recess samples as uniformly occluded and the letter shape is lost.
+// Same reasoning as the shadow: the probe distances are jittered per pixel so
+// the five fixed radii do not produce five visible contour bands.
+float ao(vec3 p, vec3 n, float rnd) {
+  float occ = 0.0, sca = 1.0;
+  for (int i = 0; i < 5; i++) {
+    float hr = 0.004 + 0.018 * (float(i) + rnd);
+    occ += (hr - mapD(p + n * hr)) * sca;
+    sca *= 0.80;
+  }
+  return clamp(1.0 - 2.6 * occ, 0.0, 1.0);
+}
+
+// The floor is an exact plane, so it is solved with one division instead of
+// being sphere-traced. That matters more than it sounds: a plane marched at a
+// grazing angle converges very slowly, and the floor is most of the frame.
+// The slab is then marched only inside its bounding box -- a span of at most
+// ~3 units -- rather than all the way from the camera.
+bool trace(vec3 ro, vec3 rd, out float t, out float mat) {
+  float tFloor = 1e9;
+  if (rd.y < -1e-4) {
+    float tp = -ro.y / rd.y;
+    if (tp > 0.0) tFloor = tp;
+  }
+
+  float tSlab = 1e9;
+  float b0, b1;
+  if (boxSpan(ro, rd, BC, BH, b0, b1)) {
+    float tt   = max(b0, 0.0);
+    float tEnd = min(b1, min(tFloor, 400.0));
+    for (int i = 0; i < STEPS; i++) {
+      if (tt > tEnd) break;
+      float d = carvedD(ro + rd * tt);
+      if (d < 0.0004 * tt + 0.00025) { tSlab = tt; break; }
+      tt += d * 0.9;
+    }
+  }
+
+  if (tSlab < tFloor) { t = tSlab;  mat = 1.0; return true; }
+  if (tFloor < 1e8)   { t = tFloor; mat = 2.0; return true; }
+  mat = 0.0;
+  return false;
+}
+
+vec3 aces(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+float hash12(vec2 p) {
+  vec3 q = fract(vec3(p.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.x + q.y) * q.z);
+}
+
+// A blurred environment lookup, standing in for a prefiltered one. Taking a
+// single mirror sample of a sharp strip light is the other half of the aliasing
+// problem: the reflected image has detail far finer than one pixel, so it
+// flickers as the surface turns. Spreading a few taps by the roughness costs
+// little and removes it at the source rather than hiding it behind more rays.
+// Eight taps rather than six, and the spiral is rotated by a per-pixel amount.
+// A fixed rotation makes all eight taps land in the same directions on every
+// pixel, so the strip lights reflect as eight discrete lobes with visible steps
+// between them instead of one smooth highlight.
+vec3 envRough(vec3 r, float rough, float rnd) {
+  vec3 t = normalize(abs(r.y) < 0.9 ? cross(r, vec3(0.0, 1.0, 0.0))
+                                    : cross(r, vec3(1.0, 0.0, 0.0)));
+  vec3 b = cross(r, t);
+  vec3 sum = vec3(0.0);
+  for (int i = 0; i < 8; i++) {
+    float a  = (float(i) + rnd) * 2.3999632;
+    float rr = sqrt((float(i) + 0.5) / 8.0) * rough * 0.5;
+    sum += env(normalize(r + (cos(a) * t + sin(a) * b) * rr));
+  }
+  return sum / 8.0;
+}
+
+vec3 shadeAlu(vec3 p, vec3 n, vec3 v, float occ, float rnd) {
+  vec3 l = normalize(KEY);
+  vec3 r = reflect(-v, n);
+  float fres = pow(1.0 - max(dot(n, v), 0.0), 5.0);
+  vec3  F = ALU + (1.0 - ALU) * fres;
+  vec3 col = envRough(r, ALU_R, rnd) * F * occ;
+  col += ALU * KEYC * KEYI * ggx(n, v, l, ALU_R) * shadow(p, l, rnd);
+  return col;
+}
+
+vec3 shade(vec2 uv, float rnd) {
+  // Off-axis by default: square-on, an extruded slab reads as a flat rectangle
+  // and the depth of the carving is invisible. At ~22 degrees you see a sliver
+  // of the side wall, so the letters are obviously cut through solid material.
+  float yaw   = uCam.x;
+  float pitch = uCam.y;
+  float dist  = uCam.z;
+
+  vec3 ta = vec3(0.0, SLAB_H * 0.5, 0.0);
+  vec3 ro = ta + vec3(sin(yaw) * cos(pitch), sin(pitch), -cos(yaw) * cos(pitch)) * dist;
+  vec3 fw = normalize(ta - ro);
+  vec3 rt = normalize(cross(vec3(0.0, 1.0, 0.0), fw));
+  vec3 up = cross(fw, rt);
+  vec3 rd = normalize(fw * 1.55 + rt * uv.x + up * uv.y);
+
+  vec3 col = vec3(0.0);
+  float t, mat;
+
+  if (trace(ro, rd, t, mat)) {
+    vec3 p = ro + rd * t;
+    vec3 v = -rd;
+    // the floor's normal is known exactly; only the slab needs sampling
+    vec3 n = mat < 1.5 ? normalSlab(p) : vec3(0.0, 1.0, 0.0);
+    float occ = ao(p, n, rnd);
+
+    if (mat < 1.5) {
+      col = shadeAlu(p, n, v, occ, rnd);
+    } else {
+      // Floor: nearly black, matte, no reflection at all. The shadow and the
+      // occlusion are what plant the slab on it -- a mirror bounce was reading
+      // as a second, brighter object and fighting the dark scene.
+      vec3 l = normalize(KEY);
+      float sh = shadow(p, l, rnd);
+      vec3 albedo = vec3(0.022, 0.023, 0.026);
+      col  = albedo * KEYC * KEYI * max(dot(n, l), 0.0) * sh * 0.30;
+      col += albedo * env(n) * 0.5 * occ;
+      // The floor falls into the dark past the slab. Tied to the camera
+      // distance, not a constant, or zooming out would black out the floor
+      // immediately and zooming in would light it to the horizon.
+      col *= exp(-max(t - (uCam.z - 0.2), 0.0) * 0.30);
+    }
+  }
+  return col;
+}
+
+void main() {
+  // Rotated-grid supersampling, averaged in linear light before the tonemap.
+  // The slab's silhouette and the carved letter edges are high-contrast against
+  // near-black, which is the worst case for edge aliasing.
+  vec3 col = vec3(0.0);
+  const mat2 skew = mat2(0.8944, -0.4472, 0.4472, 0.8944);
+  // One seed per pixel, decorrelated per supersample, so the jittered shadow
+  // and reflection estimates average across the samples instead of all four
+  // rays repeating the same error.
+  float base = hash12(gl_FragCoord.xy);
+  for (int j = 0; j < AA; j++) {
+    for (int i = 0; i < AA; i++) {
+      vec2 o = (vec2(float(i), float(j)) + 0.5) / float(AA) - 0.5;
+      float rnd = fract(base + float(j * AA + i) * 0.6180339887);
+      col += shade((gl_FragCoord.xy + skew * o - 0.5 * uRes) / uRes.y, rnd);
+    }
+  }
+  col /= float(AA * AA);
+
+  col *= uExposure;
+  col = aces(col);
+  col = pow(col, vec3(0.4545));
+  col += (hash12(gl_FragCoord.xy + fract(uTime) * 61.0) - 0.5) / 255.0;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script src="../wordmark.js"></script>
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hud    = document.getElementById("hud");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  canvas.style.display = "none";
+  hud.style.display = "none";
+}
+
+const gl = canvas.getContext("webgl", { antialias: false, alpha: false, depth: false, powerPreference: "high-performance" })
+        || canvas.getContext("experimental-webgl");
+if (!gl) fail("WebGL is not available in this browser.");
+
+const params = new URLSearchParams(location.search);
+if (params.has("hud")) hud.style.display = "block";
+const mobile = matchMedia("(pointer: coarse)").matches;
+
+// The camera/lattice readouts are a tuning tool, not something a visitor should
+// find in their console. Same flag as the HUD, so ?hud=1 turns on the whole
+// dev surface and the plain URL is silent.
+const DEV = params.has("hud") || params.has("dev");
+const say = (...a) => { if (DEV) console.log(...a); };
+
+function num(name, dflt) {
+  const v = parseFloat(params.get(name));
+  return isFinite(v) ? v : dflt;
+}
+
+// Cost is (dprCap * scale * AA)^2 in rays, so those three multiply. STEPS can
+// be far lower than before because the march is now bounded to the slab's
+// bounding box -- a span of about 3 units, not the whole 40-unit ray.
+// Since the shadow, AO and reflection estimates are now jittered per pixel,
+// rays matter more than resolution -- there has to be something to average the
+// noise against. So every rung carries AA >= 2, and the cheap end buys that by
+// rendering a smaller buffer rather than by dropping to a single ray.
+const PRESETS = {
+  low:    { STEPS: 55,  SHADOW_STEPS: 12, AA: 2, scale: 0.50, dprCap: 1.0 },
+  medium: { STEPS: 70,  SHADOW_STEPS: 16, AA: 2, scale: 0.80, dprCap: 1.25 },
+  high:   { STEPS: 85,  SHADOW_STEPS: 22, AA: 3, scale: 0.80, dprCap: 1.25 },
+  ultra:  { STEPS: 120, SHADOW_STEPS: 30, AA: 4, scale: 1.00, dprCap: 1.5 },
+};
+const qName = params.get("q") || (mobile ? "low" : "high");
+const Q = { ...(PRESETS[qName] || PRESETS.high) };
+const EV = num("ev", 1.0);
+
+// ?aa= overrides the preset's supersampling independently, so AA can be tuned
+// without also changing resolution and step counts. It is a compile-time loop
+// bound, so it is read once at load rather than being live.
+{
+  const a = parseInt(params.get("aa"), 10);
+  if (isFinite(a)) Q.AA = Math.max(1, Math.min(4, a));
+  // and ?res= for the buffer scale, for the same reason
+  const r = parseFloat(params.get("res"));
+  if (isFinite(r)) Q.scale = Math.max(0.25, Math.min(2.0, r));
+}
+
+function compile(type, src, label) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    const numbered = src.split("\n").map((l, i) => String(i + 1).padStart(4) + " | " + l).join("\n");
+    throw new Error(label + " failed to compile:\n\n" + log + "\n\n" + numbered);
+  }
+  return s;
+}
+
+let prog, U = {}, ok = false;
+try {
+  const glyphs = WORDMARK_GLSL + "\n" + INV_GLSL;
+  const fsSrc = `#define STEPS ${Q.STEPS}\n#define SHADOW_STEPS ${Q.SHADOW_STEPS}\n#define AA ${Q.AA}\n`
+    + document.getElementById("fs").textContent.replace("__GLYPHS__", glyphs);
+
+  prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById("vs").textContent, "vertex"));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc, "fragment"));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error("program failed to link:\n\n" + gl.getProgramInfoLog(prog));
+
+  gl.useProgram(prog);
+  for (const k of ["uRes", "uTime", "uCam", "uExposure",
+                   "uLatAng", "uLatCell", "uLatMot", "uLatT"]) U[k] = gl.getUniformLocation(prog, k);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(prog, "aPos");
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  ok = true;
+} catch (e) {
+  fail(String(e.message || e));
+}
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, Q.dprCap) * Q.scale;
+  const w = Math.max(1, Math.round(canvas.clientWidth  * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+
+// ---- camera -------------------------------------------------------------
+// Absolute state, not an offset from a hardcoded default, so whatever gets
+// logged can be pasted straight back in via ?cam= and reproduce the view.
+// ?cam=0.695,0.428,6.04 -- 39.8 deg round, looking down 24.5 deg
+const CAM_DEFAULT = { yaw: 0.695, pitch: 0.428, dist: 6.04 };
+const cam = { ...CAM_DEFAULT };
+
+{
+  const raw = params.get("cam");
+  if (raw) {
+    const v = raw.split(",").map(Number);
+    if (v.length === 3 && v.every(isFinite)) {
+      cam.yaw = v[0];
+      cam.pitch = Math.max(-0.30, Math.min(0.85, v[1]));
+      cam.dist = Math.max(2.2, Math.min(40, v[2]));
+    } else {
+      console.warn("?cam= expects yaw,pitch,dist -- ignoring " + JSON.stringify(raw));
+    }
+  }
+}
+
+// ---- lattice -------------------------------------------------------------
+const SLAB_D = 0.34;   // mirrors the shader, for the penetration check below
+
+// ?lat=0.412,0.675,0.369,3.000,1.450,5.200,0.300,0.085,1.700
+// 44.3 deg angle of attack, 1.76 INV across by 4.11 rows, rows staggered.
+//
+// cellY is in glyph units and the cap height is 1.0, so it cannot go below
+// about 1.1 -- at 1.0 the glyph exactly fills its cell and the repetition has
+// no margin left, which shows up as seams between rows.
+const LAT_DEFAULT = {
+  yaw: 0.412, pitch: 0.675,      // angle of attack
+  gscale: 0.369,                 // glyph units -> world (0.295 * 1.25)
+  cellX: 3.00, cellY: 1.450, cellZ: 5.20,
+  driftZ: 0.300, driftX: 0.085,
+  blockHD: 1.700,
+};
+const lat = { ...LAT_DEFAULT };
+const LAT_ORDER = ["yaw", "pitch", "gscale", "cellX", "cellY", "cellZ", "driftZ", "driftX", "blockHD"];
+
+{
+  const raw = params.get("lat");
+  if (raw) {
+    const v = raw.split(",").map(Number);
+    if (v.length === LAT_ORDER.length && v.every(isFinite))
+      LAT_ORDER.forEach((k, i) => { lat[k] = v[i]; });
+    else
+      console.warn("?lat= expects " + LAT_ORDER.length + " numbers (" +
+                   LAT_ORDER.join(",") + ") -- ignoring " + JSON.stringify(raw));
+  }
+}
+
+function clampLat() {
+  lat.gscale  = Math.max(0.03, Math.min(1.20, lat.gscale));
+  lat.cellX   = Math.max(2.60, Math.min(14.0, lat.cellX));    // below the glyph
+  lat.cellY   = Math.max(1.10, Math.min(14.0, lat.cellY));    // width it clips
+  lat.cellZ   = Math.max(0.60, Math.min(24.0, lat.cellZ));
+  lat.blockHD = Math.max(0.15, Math.min(12.0, lat.blockHD));
+  lat.pitch   = Math.max(-1.3, Math.min(1.3, lat.pitch));
+}
+
+// Does a block still cut all the way through at the current angle? If not the
+// letters bottom out as recesses instead of holes, which is the single easiest
+// thing to break while tuning.
+function penetration() {
+  const cosT = Math.cos(lat.yaw) * Math.cos(lat.pitch);
+  const need = SLAB_D / Math.max(cosT, 1e-3);
+  const have = 2 * lat.blockHD * lat.gscale;
+  return {
+    angleDeg: Math.acos(Math.max(-1, Math.min(1, cosT))) * 180 / Math.PI,
+    need, have, ok: have > need,
+    duty: (2 * lat.blockHD) / lat.cellZ,
+    periodSec: lat.driftZ > 1e-4 ? lat.cellZ / lat.driftZ : Infinity,
+    across: 1.95 / (lat.cellX * lat.gscale),
+    rows: 2.20 / (lat.cellY * lat.gscale),
+    marginX: (lat.cellX * lat.gscale - 2.485 * lat.gscale) / 2,
+  };
+}
+
+const latStr = () => LAT_ORDER.map(k => lat[k].toFixed(3)).join(",");
+
+const camStr = () =>
+  cam.yaw.toFixed(3) + "," + cam.pitch.toFixed(3) + "," + cam.dist.toFixed(2);
+
+let latLogTimer = 0;
+function logLat(why) {
+  clearTimeout(latLogTimer);
+  latLogTimer = setTimeout(() => {
+    const p = penetration();
+    say(
+      "lattice (" + why + ")\n" +
+      "  angle of attack  " + p.angleDeg.toFixed(1) + " deg   (yaw " + lat.yaw.toFixed(3) +
+        ", pitch " + lat.pitch.toFixed(3) + ")\n" +
+      "  glyph scale      " + lat.gscale.toFixed(3) +
+        "   cell " + lat.cellX.toFixed(2) + " x " + lat.cellY.toFixed(2) + " x " + lat.cellZ.toFixed(2) + "\n" +
+      "  layout           " + p.across.toFixed(2) + " INV across, " + p.rows.toFixed(2) + " rows" +
+        "   cell margin x " + p.marginX.toFixed(4) + (p.marginX < 0.01 ? "  <-- tight, may seam" : "") + "\n" +
+      "  motion           drift z " + lat.driftZ.toFixed(3) + ", x " + lat.driftX.toFixed(3) +
+        "   period " + (isFinite(p.periodSec) ? p.periodSec.toFixed(1) + "s" : "paused") +
+        "   duty " + (p.duty * 100).toFixed(0) + "%\n" +
+      "  cuts through     " + (p.ok ? "yes" : "NO -- letters bottom out as dents") +
+        "   (needs " + p.need.toFixed(3) + ", has " + p.have.toFixed(3) + ")\n" +
+      "  ?lat=" + latStr()
+    );
+  }, 220);
+}
+
+let logTimer = 0;
+function logCam(why) {
+  clearTimeout(logTimer);
+  logTimer = setTimeout(() => {
+    const fov = 2 * Math.atan(0.5 / 1.55) * 180 / Math.PI;
+    say(
+      "camera (" + why + ")\n" +
+      "  yaw   " + cam.yaw.toFixed(3) + " rad  (" + (cam.yaw * 180 / Math.PI).toFixed(1) + " deg)\n" +
+      "  pitch " + cam.pitch.toFixed(3) + " rad  (" + (cam.pitch * 180 / Math.PI).toFixed(1) + " deg)\n" +
+      "  dist  " + cam.dist.toFixed(2) + "   (vertical fov " + fov.toFixed(1) + " deg, " +
+        "slab fills " + ((SLAB_H / (2 * (0.5 / 1.55) * cam.dist)) * 100).toFixed(0) + "% of height)\n" +
+      "  ?cam=" + camStr()
+    );
+  }, 220);
+}
+
+const SLAB_H = 2.20;   // mirrors the shader constant, for the readout only
+
+// Two modes over the same pointer: camera (default) and lattice. Rather than
+// invent a second set of gestures, L swaps what drag and scroll are wired to.
+let mode = params.get("mode") === "lattice" ? "lattice" : "camera";
+
+let drag = null;
+function pt(e) { const t = e.touches ? e.touches[0] : e; return { x: t.clientX, y: t.clientY }; }
+function down(e) { drag = pt(e); canvas.classList.add("drag"); }
+function move(e) {
+  if (!drag) return;
+  const p = pt(e);
+  const dx = p.x - drag.x, dy = p.y - drag.y;
+  if (mode === "lattice") {
+    lat.yaw   += dx * 0.004;
+    lat.pitch += dy * 0.003;
+    clampLat();
+    logLat("drag");
+  } else {
+    cam.yaw += dx * 0.005;
+    cam.pitch = Math.max(-0.30, Math.min(0.85, cam.pitch + dy * 0.003));
+    logCam("drag");
+  }
+  drag = p;
+  e.preventDefault();
+}
+function up() { drag = null; canvas.classList.remove("drag"); }
+canvas.addEventListener("mousedown", down);
+addEventListener("mousemove", move);
+addEventListener("mouseup", up);
+canvas.addEventListener("touchstart", down, { passive: true });
+canvas.addEventListener("touchmove", move, { passive: false });
+canvas.addEventListener("touchend", up);
+
+// Multiplicative zoom: a notch of wheel changes the distance by a fixed
+// proportion, so it feels the same whether you are close in or far out.
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const step = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;   // lines vs pixels
+  if (mode === "lattice") {
+    // shift scrolls the depth spacing, otherwise the glyph size
+    if (e.shiftKey) lat.cellZ *= Math.exp(step * 0.0014);
+    else            lat.gscale *= Math.exp(-step * 0.0011);
+    clampLat();
+    logLat(e.shiftKey ? "cell z" : "glyph scale");
+  } else {
+    cam.dist = Math.max(2.2, Math.min(40, cam.dist * Math.exp(step * 0.0011)));
+    logCam("zoom");
+  }
+}, { passive: false });
+
+// pinch to zoom, for touch
+let pinch = 0;
+canvas.addEventListener("touchstart", e => {
+  if (e.touches.length === 2) {
+    pinch = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                       e.touches[0].clientY - e.touches[1].clientY);
+    drag = null;
+  }
+}, { passive: true });
+canvas.addEventListener("touchmove", e => {
+  if (e.touches.length === 2 && pinch > 0) {
+    const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX,
+                         e.touches[0].clientY - e.touches[1].clientY);
+    cam.dist = Math.max(2.2, Math.min(40, cam.dist * (pinch / d)));
+    pinch = d;
+    logCam("pinch");
+    e.preventDefault();
+  }
+}, { passive: false });
+canvas.addEventListener("touchend", () => { pinch = 0; });
+
+// Lattice clock, advanced by JS rather than read from uTime, so it can be
+// paused and scrubbed. Freezing it is the only way to line the letters up on a
+// specific frame and read the numbers off.
+let latT = 0, latPaused = false, lastNow = performance.now();
+
+addEventListener("keydown", e => {
+  const k = e.key;
+  if (k === "l" || k === "L") {
+    mode = mode === "lattice" ? "camera" : "lattice";
+    say("mode: " + mode + (mode === "lattice"
+      ? "  -- drag = angle of attack, scroll = glyph scale, shift+scroll = cell z,\n" +
+        "     [ ] cell x   ; ' cell y   , . block depth   - = drift speed\n" +
+        "     space = pause/resume   < > scrub   R = reset lattice"
+      : "  -- drag = orbit, scroll = zoom, R = reset camera"));
+    return;
+  }
+
+  if (mode === "camera") {
+    if (k === "r" || k === "R") { Object.assign(cam, CAM_DEFAULT); logCam("reset"); }
+    return;
+  }
+
+  // ---- lattice mode ----
+  let hit = true;
+  switch (k) {
+    case "[": lat.cellX -= 0.1; break;
+    case "]": lat.cellX += 0.1; break;
+    case ";": lat.cellY -= 0.1; break;
+    case "'": lat.cellY += 0.1; break;
+    case ",": lat.blockHD -= 0.05; break;
+    case ".": lat.blockHD += 0.05; break;
+    case "-": lat.driftZ = Math.max(0, lat.driftZ - 0.02); break;
+    case "=": lat.driftZ += 0.02; break;
+    case "_": lat.driftX = lat.driftX - 0.01; break;
+    case "+": lat.driftX = lat.driftX + 0.01; break;
+    case " ": latPaused = !latPaused; break;
+    case "<": latT -= 0.35; break;
+    case ">": latT += 0.35; break;
+    case "r": case "R": Object.assign(lat, LAT_DEFAULT); break;
+    default: hit = false;
+  }
+  if (hit) {
+    e.preventDefault();
+    clampLat();
+    logLat(k === " " ? (latPaused ? "paused" : "resumed")
+         : (k === "<" || k === ">") ? "scrub"
+         : k === "r" || k === "R" ? "reset" : "key " + k);
+  }
+});
+
+logCam("initial");
+logLat("initial");
+say("press L to switch between camera and lattice control");
+
+let running = true, raf = 0, frames = 0, lastHud = 0;
+const t0 = performance.now();
+
+function frame(now) {
+  if (!running) return;
+  resize();
+
+  const dt = Math.min((now - lastNow) / 1000, 0.1);
+  lastNow = now;
+  if (!latPaused) latT += dt;
+
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, (now - t0) / 1000);
+  gl.uniform3f(U.uCam, cam.yaw, cam.pitch, cam.dist);
+  gl.uniform1f(U.uExposure, EV);
+  gl.uniform2f(U.uLatAng, lat.yaw, lat.pitch);
+  gl.uniform4f(U.uLatCell, lat.cellX, lat.cellY, lat.cellZ, lat.gscale);
+  gl.uniform3f(U.uLatMot, lat.driftZ, lat.driftX, lat.blockHD);
+  gl.uniform1f(U.uLatT, latT);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  frames++;
+  if (now - lastHud > 500) {
+    const p = penetration();
+    hud.textContent =
+      `${(frames / ((now - lastHud) / 1000)).toFixed(0)} fps  ·  ${qName}` +
+      `  AA ${Q.AA}x${Q.AA} @ ${Q.scale.toFixed(2)}` +
+      ` (${(Q.AA * Q.AA * Q.scale * Q.scale).toFixed(1)} samples/px)  ${canvas.width}x${canvas.height}` +
+      `  ·  mode: ${mode}${mode === "lattice" ? (latPaused ? " (paused)" : "") : ""}  [L to switch]` +
+      (mode === "lattice"
+        ? `  ·  ${p.angleDeg.toFixed(0)}deg  scale ${lat.gscale.toFixed(3)}` +
+          `  cell ${lat.cellX.toFixed(2)}/${lat.cellY.toFixed(2)}/${lat.cellZ.toFixed(2)}` +
+          `  ${p.across.toFixed(1)}x${p.rows.toFixed(1)}  ${p.ok ? "cuts through" : "NOT THROUGH"}`
+        : `  ·  dist ${cam.dist.toFixed(2)}  ?cam=${camStr()}`);
+    frames = 0; lastHud = now;
+  }
+  raf = requestAnimationFrame(frame);
+}
+if (ok) raf = requestAnimationFrame(frame);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { running = false; cancelAnimationFrame(raf); }
+  else if (ok) { running = true; lastHud = performance.now(); frames = 0; raf = requestAnimationFrame(frame); }
+});
+addEventListener("resize", resize);
+
+canvas.addEventListener("webglcontextlost", e => {
+  e.preventDefault();
+  running = false;
+  cancelAnimationFrame(raf);
+  setTimeout(() => location.reload(), 350);
+});
+</script>
+</body>
+</html>
