@@ -523,18 +523,30 @@ const cam = { ...CAM_DEFAULT };
 // ---- lattice -------------------------------------------------------------
 const SLAB_D = 0.34;   // mirrors the shader, for the penetration check below
 
-// ?lat=0.412,0.675,0.369,3.000,1.450,5.200,0.300,0.085,1.700
+// ?lat=0.412,0.675,0.369,3.000,1.450,2.600,0.300,0.085,0.900
 // 44.3 deg angle of attack, 1.76 INV across by 4.11 rows, rows staggered.
 //
-// cellY is in glyph units and the cap height is 1.0, so it cannot go below
-// about 1.1 -- at 1.0 the glyph exactly fills its cell and the repetition has
-// no margin left, which shows up as seams between rows.
+// Two floors constrain this, and they pull against each other:
+//
+//   cellY > ~1.1   The cap height is 1.0 in glyph units, so at 1.0 the glyph
+//                  exactly fills its cell and domain repetition has no margin
+//                  left -- that shows up as seams between rows.
+//
+//   cellZ > 2*blockHD   Below that, consecutive blocks overlap along the
+//                  attack direction and the slab is permanently carved, so the
+//                  letters never arrive or leave.
+//
+// The second is why blockHD is 0.900 and not the 1.700 it used to be. A block
+// only has to be deeper than SLAB_D / cos(angle) = 0.475 world to cut through;
+// at 1.700 it was 1.255 deep, 2.6x more than needed, and that bloat was what
+// forced the sets to sit far apart. Trimming it to 0.900 (still +0.189 clear)
+// let cellZ halve while keeping the same 69% duty.
 const LAT_DEFAULT = {
   yaw: 0.412, pitch: 0.675,      // angle of attack
   gscale: 0.369,                 // glyph units -> world (0.295 * 1.25)
-  cellX: 3.00, cellY: 1.450, cellZ: 5.20,
+  cellX: 3.00, cellY: 1.450, cellZ: 2.600,
   driftZ: 0.300, driftX: 0.085,
-  blockHD: 1.700,
+  blockHD: 0.900,
 };
 const lat = { ...LAT_DEFAULT };
 const LAT_ORDER = ["yaw", "pitch", "gscale", "cellX", "cellY", "cellZ", "driftZ", "driftX", "blockHD"];
