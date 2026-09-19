@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inv.no — emerge</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f2f3f4; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100dvh; touch-action: none; }
+  canvas.drag { cursor: grabbing; }
+  #err {
+    position: fixed; inset: 0; margin: 0; padding: 1rem;
+    font: 11px/1.45 ui-monospace, Consolas, monospace;
+    color: #b00020; background: #fff; white-space: pre-wrap;
+    overflow: auto; display: none;
+  }
+  #hud {
+    position: fixed; left: 10px; bottom: 8px;
+    font: 10px/1.5 ui-monospace, Consolas, monospace;
+    color: #9aa0a6; pointer-events: none; display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<pre id="err"></pre>
+<div id="hud"></div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec3  uCam;        // yaw, pitch, distance
+uniform float uExposure;
+uniform vec3  uBlob;       // blend radius k, rise amplitude, time scale
+uniform vec4  uWave;       // seconds: rise, hold out, fall, hold under
+
+#define PI 3.141592653589793
+
+// ---------------------------------------------------------------------------
+// The surface is a WALL, not a floor: solid fills z <= 0 and the camera looks
+// straight at it. That is what removes every landmark -- with no horizon, no
+// edge and no second surface anywhere in frame, there is nothing to read the
+// scene against, so the letters have nowhere to come from.
+//
+// The wordmark therefore lies in XY (upright, readable) and pushes out along
+// +z toward the viewer.
+// ---------------------------------------------------------------------------
+const vec2  WM_C    = vec2(2.355, 0.739);   // measured centre of sdWord
+const vec2  WM_HALF = vec2(2.498, 0.736);
+const float SINK    = 1.20;                 // how far the solid extends into the wall
+const float FOCAL   = 1.70;
+const float NEED_X  = 2.95;                 // half-width to keep in frame
+const float STAGGER = 0.25;                 // seconds of delay per unit of x
+
+// Grazing, so raised letters throw long shadows across the wall. Straight-on
+// light would leave an all-white surface with nothing to see.
+const vec3 KEY  = vec3(-0.62, 0.58, 0.53);
+const vec3 KEYC = vec3(1.00, 0.99, 0.97);
+const float KEYI = 1.75;
+
+const vec3 ALBEDO = vec3(0.94, 0.94, 0.945);
+
+__GLYPHS__
+
+// ---------------------------------------------------------------------------
+// Polynomial smooth minimum -- the whole idea. A plain union would leave a
+// hard crease where the text meets the wall; blending the two fields over a
+// radius k grows a fillet instead, so they read as one continuous skin. Same
+// operator the old metaball demos used to make spheres swallow each other.
+// ---------------------------------------------------------------------------
+float smin(float a, float b, float k) {
+  float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+  return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+float sdBox3(vec3 p, vec3 b) {
+  vec3 q = abs(p) - b;
+  return min(max(q.x, max(q.y, q.z)), 0.0) + length(max(q, 0.0));
+}
+
+// How far the solid stands proud of the wall here.
+//
+// A plain sine spends equal time rising, falling and submerged, and never
+// pauses. This is a four-part cycle instead -- rise, hold at the top, fall,
+// hold under -- so the mark can sit fully out for a beat and drop back
+// quickly. Durations are in seconds (uWave), scaled by uBlob.z.
+//
+// The phase runs with x so the letters surface in sequence. Its gradient in x
+// is stagger * 2*amp * max|smoothstep'| / riseTime, about 0.16 here, small
+// enough that the field stays near-Lipschitz and the marcher will not
+// overshoot at the 0.85 step factor.
+float riseAt(float x) {
+  float period = uWave.x + uWave.y + uWave.z + uWave.w;
+  float tt = mod(uTime * uBlob.z - x * STAGGER, period);
+
+  float u;
+  if (tt < uWave.x) {
+    u = smoothstep(0.0, 1.0, tt / uWave.x);                            // rising
+  } else if (tt < uWave.x + uWave.y) {
+    u = 1.0;                                                           // held out
+  } else if (tt < uWave.x + uWave.y + uWave.z) {
+    u = 1.0 - smoothstep(0.0, 1.0, (tt - uWave.x - uWave.y) / uWave.z);// falling
+  } else {
+    u = 0.0;                                                           // submerged
+  }
+  return mix(-uBlob.y, uBlob.y, u);
+}
+
+// A box containing the whole solid; never an overestimate of the distance to
+// it, which is what makes it usable as a bound.
+float textBound(vec3 p) {
+  float top = uBlob.y + uBlob.x;
+  return sdBox3(p - vec3(0.0, 0.0, (top - SINK) * 0.5),
+                vec3(WM_HALF.x + uBlob.x, WM_HALF.y + uBlob.x, (top + SINK) * 0.5));
+}
+
+float sdText(vec3 p) {
+  float d2 = sdWord(p.xy + WM_C);
+  float hi = riseAt(p.x);
+  float wz = max(p.z - hi, -SINK - p.z);
+  return min(max(d2, wz), 0.0) + length(max(vec2(d2, wz), 0.0));
+}
+
+// ---------------------------------------------------------------------------
+// Two versions of the field, and which one a caller gets matters.
+//
+// The bounding box UNDERESTIMATES the distance to the text. That is fine for
+// deciding how far a ray may safely advance, and wrong for anything that
+// reads the value or its slope.
+// ---------------------------------------------------------------------------
+
+// EXACT. Branch one is provably equal to the wall (smin(a,b,k) == a once
+// b >= a + k), branch two is the definition. Anything that reads the value or
+// its gradient -- normals, occlusion, shadow softness -- must use this.
+float map(vec3 p) {
+  float wall = p.z;                  // solid is z <= 0
+  if (textBound(p) >= wall + uBlob.x) return wall;
+  return smin(wall, sdText(p), uBlob.x);
+}
+
+// CONSERVATIVE, and only safe for advancing a ray. min(a,b) - k/4 is the worst
+// case smin can reach, so it never overshoots -- but it is not the true
+// distance and its gradient is the gradient of the BOX, not of the surface.
+//
+// That is what drew the rounded rectangle: feeding this into the occlusion and
+// shadow terms made them see a box-shaped occluder floating around the text.
+// Marching is the one place the difference cannot show, because the isosurface
+// is identical either way.
+float mapMarch(vec3 p) {
+  float wall = p.z;
+  float bb = textBound(p);
+  if (bb >= wall + uBlob.x) return wall;
+  if (bb > 0.35)            return min(wall, bb) - uBlob.x * 0.25;
+  return smin(wall, sdText(p), uBlob.x);
+}
+
+// Slab-method ray/box intersection, used to bound the shadow ray.
+bool boxSpan(vec3 ro, vec3 rd, vec3 c, vec3 b, out float t0, out float t1) {
+  vec3 m = 1.0 / rd;
+  vec3 o = ro - c;
+  vec3 k = abs(m) * b;
+  vec3 tA = -m * o - k;
+  vec3 tB = -m * o + k;
+  t0 = max(max(tA.x, tA.y), tA.z);
+  t1 = min(min(tB.x, tB.y), tB.z);
+  return t1 > max(t0, 0.0);
+}
+
+vec3 boxC() { return vec3(0.0, 0.0, (uBlob.y + uBlob.x - SINK) * 0.5); }
+vec3 boxH() { return vec3(WM_HALF.x + uBlob.x, WM_HALF.y + uBlob.x,
+                          (uBlob.y + uBlob.x + SINK) * 0.5); }
+
+// Almost the whole frame is bare wall, where the normal is exactly +z. Four
+// field evaluations to rediscover that on every pixel is the single most
+// wasteful thing in the shader.
+vec3 normalAt(vec3 p) {
+  if (textBound(p) > 0.40) return vec3(0.0, 0.0, 1.0);
+  const vec2 k = vec2(1.0, -1.0);
+  float e = 0.0016;
+  return normalize(k.xyy * map(p + k.xyy * e)
+                 + k.yyx * map(p + k.yyx * e)
+                 + k.yxy * map(p + k.yxy * e)
+                 + k.xxx * map(p + k.xxx * e));
+}
+
+// Bright and even. There is no albedo variation anywhere, so occlusion and
+// shadow are the only things carrying the form.
+vec3 env(vec3 d) {
+  float y = d.y * 0.5 + 0.5;
+  vec3 c = mix(vec3(0.70, 0.71, 0.74), vec3(1.00, 1.00, 1.02), smoothstep(0.25, 1.0, y));
+  c += vec3(1.0, 0.99, 0.97) * 0.9 * smoothstep(0.65, 0.99, d.y);
+  return c;
+}
+
+float ggx(vec3 n, vec3 v, vec3 l, float rough) {
+  float a = max(rough * rough, 1e-4);
+  vec3  h = normalize(v + l);
+  float NoH = max(dot(n, h), 0.0);
+  float NoV = max(dot(n, v), 1e-3);
+  float NoL = max(dot(n, l), 0.0);
+  float dd  = NoH * NoH * (a * a - 1.0) + 1.0;
+  float D   = (a * a) / (PI * dd * dd);
+  float k   = a * 0.5;
+  float G   = (NoL / (NoL * (1.0 - k) + k)) * (NoV / (NoV * (1.0 - k) + k));
+  return D * G / (4.0 * NoV * max(NoL, 1e-3)) * NoL;
+}
+
+// Only the text can cast: the wall is a flat half-space and the key light
+// comes from in front of it, so it can never shadow itself. If the shadow ray
+// misses the text's box the point is simply lit -- which makes shadowing free
+// across the entire bare wall, and that is most of the frame.
+float shadow(vec3 p, vec3 l, float rnd) {
+  float t0, t1;
+  if (!boxSpan(p, l, boxC(), boxH(), t0, t1)) return 1.0;
+  float t = max(t0, 0.03) + rnd * 0.05;
+  float tEnd = min(t1, 12.0);
+  float res = 1.0;
+  for (int i = 0; i < SHADOW_STEPS; i++) {
+    if (t > tEnd) break;
+    float h = map(p + l * t);
+    res = min(res, h / (0.07 * t));
+    t += clamp(h, 0.035, 0.5);
+    if (res < 0.005) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+// On an all-white object this is not a finishing touch, it is most of what
+// makes the shape legible. The crease where a letter meets the wall is defined
+// almost entirely by occlusion.
+float ao(vec3 p, vec3 n, float rnd) {
+  // The longest probe reaches 0.287, so past 0.40 from the text box every
+  // sample lands on bare wall and the answer is exactly 1. Worth checking
+  // once rather than proving it five times per pixel.
+  if (textBound(p) > 0.40) return 1.0;
+  float occ = 0.0, sca = 1.0;
+  for (int i = 0; i < 5; i++) {
+    float hr = 0.012 + 0.055 * (float(i) + rnd);
+    occ += (hr - map(p + n * hr)) * sca;
+    sca *= 0.78;
+  }
+  return clamp(1.0 - 1.9 * occ, 0.0, 1.0);
+}
+
+vec3 aces(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+float hash12(vec2 p) {
+  vec3 q = fract(vec3(p.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.x + q.y) * q.z);
+}
+
+vec3 shade(vec2 uv, float rnd) {
+  // Pull back far enough that the wordmark fits however narrow the viewport
+  // is. Straight on, the mark is 5.0 wide against 1.5 tall, so width binds --
+  // a portrait phone at the desktop distance would crop it by half.
+  float aspect = uRes.x / uRes.y;
+  float fit  = NEED_X / max(aspect * 0.5 / FOCAL, 1e-3);
+  float dist = max(uCam.z, fit);
+
+  float yaw = uCam.x, pitch = uCam.y;
+  vec3 ta = vec3(0.0);
+  vec3 ro = ta + vec3(sin(yaw) * cos(pitch), sin(pitch), cos(yaw) * cos(pitch)) * dist;
+  // The camera sits on the +z side here, unlike the other experiments. With
+  // cross(worldUp, fw) that flips the handedness and the wordmark comes out
+  // mirrored; cross(fw, worldUp) keeps screen-right pointing at world +x.
+  vec3 fw = normalize(ta - ro);
+  vec3 rt = normalize(cross(fw, vec3(0.0, 1.0, 0.0)));
+  vec3 up = cross(rt, fw);
+  vec3 rd = normalize(fw * FOCAL + rt * uv.x + up * uv.y);
+
+  float t = 0.0;
+  bool hit = false;
+  for (int i = 0; i < STEPS; i++) {
+    float d = mapMarch(ro + rd * t);
+    if (d < 0.0005 * t + 0.0004) { hit = true; break; }
+    t += d * 0.85;                 // the x-varying rise leaves the field only
+    if (t > 80.0) break;           // near-Lipschitz, so do not take full steps
+  }
+
+  if (!hit) return env(rd);
+
+  vec3 p = ro + rd * t;
+  vec3 n = normalAt(p);
+  vec3 v = -rd;
+  vec3 l = normalize(KEY);
+
+  float occ = ao(p, n, rnd);
+  float sh  = shadow(p, l, rnd);
+
+  vec3 col = ALBEDO * KEYC * KEYI * max(dot(n, l), 0.0) * sh;
+  col += ALBEDO * env(n) * 0.58 * occ;
+  col += vec3(0.9) * ggx(n, v, l, 0.45) * sh * 0.18;
+  return col;
+}
+
+void main() {
+  vec3 col = vec3(0.0);
+  const mat2 skew = mat2(0.8944, -0.4472, 0.4472, 0.8944);
+  float base = hash12(gl_FragCoord.xy);
+  for (int j = 0; j < AA; j++) {
+    for (int i = 0; i < AA; i++) {
+      vec2 o = (vec2(float(i), float(j)) + 0.5) / float(AA) - 0.5;
+      float rnd = fract(base + float(j * AA + i) * 0.6180339887);
+      col += shade((gl_FragCoord.xy + skew * o - 0.5 * uRes) / uRes.y, rnd);
+    }
+  }
+  col /= float(AA * AA);
+
+  col *= uExposure;
+  col = aces(col);
+  col = pow(col, vec3(0.4545));
+  col += (hash12(gl_FragCoord.xy + fract(uTime) * 61.0) - 0.5) / 255.0;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script src="../wordmark.js"></script>
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hud    = document.getElementById("hud");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  canvas.style.display = "none";
+  hud.style.display = "none";
+}
+
+const gl = canvas.getContext("webgl", { antialias: false, alpha: false, depth: false, powerPreference: "high-performance" })
+        || canvas.getContext("experimental-webgl");
+if (!gl) fail("WebGL is not available in this browser.");
+
+const params = new URLSearchParams(location.search);
+if (params.has("hud")) hud.style.display = "block";
+const mobile = matchMedia("(pointer: coarse)").matches;
+const DEV = params.has("hud") || params.has("dev");
+const say = (...a) => { if (DEV) console.log(...a); };
+
+function num(name, dflt) {
+  const v = parseFloat(params.get(name));
+  return isFinite(v) ? v : dflt;
+}
+
+const PRESETS = {
+  low:    { STEPS: 60,  SHADOW_STEPS: 10, AA: 2, scale: 0.35, dprCap: 1.0 },
+  medium: { STEPS: 80,  SHADOW_STEPS: 14, AA: 2, scale: 0.55, dprCap: 1.0 },
+  high:   { STEPS: 100, SHADOW_STEPS: 18, AA: 2, scale: 0.70, dprCap: 1.0 },
+  ultra:  { STEPS: 140, SHADOW_STEPS: 26, AA: 3, scale: 0.90, dprCap: 1.25 },
+};
+const qName = params.get("q") || (mobile ? "low" : "high");
+const Q = { ...(PRESETS[qName] || PRESETS.high) };
+{
+  const a = parseInt(params.get("aa"), 10);
+  if (isFinite(a)) Q.AA = Math.max(1, Math.min(4, a));
+  const r = parseFloat(params.get("res"));
+  if (isFinite(r)) Q.scale = Math.max(0.25, Math.min(2.0, r));
+}
+const EV = num("ev", 1.0);
+
+const blob = { k: num("k", 0.26), amp: num("amp", 0.46), speed: num("speed", 1.0) };
+
+// seconds: rise, hold out, fall, hold under
+const wave = {
+  rise: num("rise", 2.2),
+  top:  num("top",  2.0),
+  fall: num("fall", 2.2),
+  bot:  num("bot",  1.0),
+};
+
+// straight on: yaw 0, pitch 0
+const CAM_DEFAULT = { yaw: 0.0, pitch: 0.0, dist: 9.0 };
+const cam = { ...CAM_DEFAULT };
+{
+  const raw = params.get("cam");
+  if (raw) {
+    const v = raw.split(",").map(Number);
+    if (v.length === 3 && v.every(isFinite)) {
+      cam.yaw = Math.max(-1.0, Math.min(1.0, v[0]));
+      cam.pitch = Math.max(-0.9, Math.min(0.9, v[1]));
+      cam.dist = Math.max(3.0, Math.min(40, v[2]));
+    } else {
+      console.warn("?cam= expects yaw,pitch,dist -- ignoring " + JSON.stringify(raw));
+    }
+  }
+}
+const camStr = () => cam.yaw.toFixed(3) + "," + cam.pitch.toFixed(3) + "," + cam.dist.toFixed(2);
+
+let logTimer = 0;
+function logCam(why) {
+  clearTimeout(logTimer);
+  logTimer = setTimeout(() => {
+    say("camera (" + why + ")\n" +
+        "  yaw   " + cam.yaw.toFixed(3) + " rad  (" + (cam.yaw * 180 / Math.PI).toFixed(1) + " deg off straight-on)\n" +
+        "  pitch " + cam.pitch.toFixed(3) + " rad  (" + (cam.pitch * 180 / Math.PI).toFixed(1) + " deg)\n" +
+        "  dist  " + cam.dist.toFixed(2) + "\n" +
+        "  ?cam=" + camStr() + "   ?k=" + blob.k + " ?amp=" + blob.amp + " ?speed=" + blob.speed);
+  }, 220);
+}
+
+function compile(type, src, label) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    const numbered = src.split("\n").map((l, i) => String(i + 1).padStart(4) + " | " + l).join("\n");
+    throw new Error(label + " failed to compile:\n\n" + log + "\n\n" + numbered);
+  }
+  return s;
+}
+
+let prog, U = {}, ok = false;
+try {
+  const fsSrc = `#define STEPS ${Q.STEPS}\n#define SHADOW_STEPS ${Q.SHADOW_STEPS}\n#define AA ${Q.AA}\n`
+    + document.getElementById("fs").textContent.replace("__GLYPHS__", WORDMARK_GLSL);
+
+  prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById("vs").textContent, "vertex"));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc, "fragment"));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error("program failed to link:\n\n" + gl.getProgramInfoLog(prog));
+
+  gl.useProgram(prog);
+  for (const k of ["uRes", "uTime", "uCam", "uExposure", "uBlob", "uWave"]) U[k] = gl.getUniformLocation(prog, k);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(prog, "aPos");
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  ok = true;
+} catch (e) {
+  fail(String(e.message || e));
+}
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, Q.dprCap) * Q.scale;
+  const w = Math.max(1, Math.round(canvas.clientWidth  * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+
+let drag = null;
+function pt(e) { const t = e.touches ? e.touches[0] : e; return { x: t.clientX, y: t.clientY }; }
+function down(e) { drag = pt(e); canvas.classList.add("drag"); }
+function move(e) {
+  if (!drag) return;
+  const p = pt(e);
+  cam.yaw   = Math.max(-1.0, Math.min(1.0, cam.yaw   + (p.x - drag.x) * 0.004));
+  cam.pitch = Math.max(-0.9, Math.min(0.9, cam.pitch + (p.y - drag.y) * 0.003));
+  drag = p;
+  logCam("drag");
+  e.preventDefault();
+}
+function up() { drag = null; canvas.classList.remove("drag"); }
+// The camera is fixed for this one. Orbiting it defeats the point -- the
+// effect depends on the wall being a featureless field with no parallax to
+// give away that there is a scene at all. The controls stay available under
+// ?hud / ?dev so a view can still be dialled in, and ?cam= sets it outright.
+if (DEV) {
+  canvas.addEventListener("mousedown", down);
+  addEventListener("mousemove", move);
+  addEventListener("mouseup", up);
+  canvas.addEventListener("touchstart", down, { passive: true });
+  canvas.addEventListener("touchmove", move, { passive: false });
+  canvas.addEventListener("touchend", up);
+
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    const step = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+    cam.dist = Math.max(3.0, Math.min(40, cam.dist * Math.exp(step * 0.0011)));
+    logCam("zoom");
+  }, { passive: false });
+
+  addEventListener("keydown", e => {
+    if (e.key === "r" || e.key === "R") { Object.assign(cam, CAM_DEFAULT); logCam("reset"); }
+  });
+} else {
+  canvas.style.cursor = "default";
+}
+
+let running = true, raf = 0, frames = 0, lastHud = 0;
+const t0 = performance.now();
+
+function frame(now) {
+  if (!running) return;
+  resize();
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, (now - t0) / 1000);
+  gl.uniform3f(U.uCam, cam.yaw, cam.pitch, cam.dist);
+  gl.uniform1f(U.uExposure, EV);
+  gl.uniform3f(U.uBlob, blob.k, blob.amp, blob.speed);
+  gl.uniform4f(U.uWave, wave.rise, wave.top, wave.fall, wave.bot);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  frames++;
+  if (now - lastHud > 500) {
+    hud.textContent = `${(frames / ((now - lastHud) / 1000)).toFixed(0)} fps  ·  ${qName}` +
+      `  AA ${Q.AA}x${Q.AA} @ ${Q.scale.toFixed(2)}  ${canvas.width}x${canvas.height}` +
+      `  ·  k ${blob.k}  amp ${blob.amp}  cycle ${(wave.rise+wave.top+wave.fall+wave.bot).toFixed(1)}s` +
+      ` (rise ${wave.rise} top ${wave.top} fall ${wave.fall} under ${wave.bot})` +
+      `  ·  camera fixed (drag/zoom only in dev)  ·  ?cam= ?k= ?amp= ?rise= ?top= ?fall= ?bot= ?q= ?aa= ?res= ?ev=`;
+    frames = 0; lastHud = now;
+  }
+  raf = requestAnimationFrame(frame);
+}
+if (ok) raf = requestAnimationFrame(frame);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { running = false; cancelAnimationFrame(raf); }
+  else if (ok) { running = true; lastHud = performance.now(); frames = 0; raf = requestAnimationFrame(frame); }
+});
+addEventListener("resize", resize);
+
+canvas.addEventListener("webglcontextlost", e => {
+  e.preventDefault();
+  running = false;
+  cancelAnimationFrame(raf);
+  setTimeout(() => location.reload(), 350);
+});
+
+logCam("initial");
+</script>
+</body>
+</html>
