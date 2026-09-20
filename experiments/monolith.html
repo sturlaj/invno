@@ -429,7 +429,7 @@ function num(name, dflt) {
 // noise against. So every rung carries AA >= 2, and the cheap end buys that by
 // rendering a smaller buffer rather than by dropping to a single ray.
 const PRESETS = {
-  low:    { STEPS: 55,  SHADOW_STEPS: 14, AA: 2, scale: 0.70, dprCap: 1.0 },
+  low:    { STEPS: 55,  SHADOW_STEPS: 14, AA: 2, scale: 0.50, dprCap: 1.0 },
   medium: { STEPS: 70,  SHADOW_STEPS: 16, AA: 2, scale: 0.80, dprCap: 1.25 },
   high:   { STEPS: 85,  SHADOW_STEPS: 22, AA: 3, scale: 0.80, dprCap: 1.25 },
   ultra:  { STEPS: 120, SHADOW_STEPS: 30, AA: 4, scale: 1.00, dprCap: 1.5 },
@@ -441,6 +441,13 @@ const EV = num("ev", 1.0);
 // ?aa= overrides the preset's supersampling independently, so AA can be tuned
 // without also changing resolution and step counts. It is a compile-time loop
 // bound, so it is read once at load rather than being live.
+// A phone gets the full CSS-pixel buffer. It has far fewer CSS pixels to fill
+// than a desktop window -- 402x874 against 1920x1080 is under a fifth the
+// area -- so scale 1.0 there is still well under the work the desktop rung
+// does at 0.80. Scaling the buffer down as well as capping dpr was shrinking
+// it twice over, and the upscale to a 3x screen made that plainly visible.
+if (mobile && !params.has("q") && !params.has("res")) Q.scale = 1.0;
+
 {
   const a = parseInt(params.get("aa"), 10);
   if (isFinite(a)) Q.AA = Math.max(1, Math.min(4, a));

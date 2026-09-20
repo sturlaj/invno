@@ -354,13 +354,20 @@ function num(name, dflt) {
 }
 
 const PRESETS = {
-  low:    { STEPS: 70,  SHADOW_STEPS: 14, AA: 2, scale: 0.60, dprCap: 1.0 },
-  medium: { STEPS: 80,  SHADOW_STEPS: 16, AA: 2, scale: 0.65, dprCap: 1.0 },
+  low:    { STEPS: 70,  SHADOW_STEPS: 14, AA: 2, scale: 0.40, dprCap: 1.0 },
+  medium: { STEPS: 80,  SHADOW_STEPS: 16, AA: 2, scale: 0.55, dprCap: 1.0 },
   high:   { STEPS: 100, SHADOW_STEPS: 18, AA: 2, scale: 0.70, dprCap: 1.0 },
   ultra:  { STEPS: 140, SHADOW_STEPS: 26, AA: 3, scale: 0.90, dprCap: 1.25 },
 };
 const qName = params.get("q") || (mobile ? "low" : "high");
 const Q = { ...(PRESETS[qName] || PRESETS.high) };
+// A phone gets the full CSS-pixel buffer. It has far fewer CSS pixels to fill
+// than a desktop window -- 402x874 against 1920x1080 is under a fifth the
+// area -- so scale 1.0 there is still a third of the work the desktop rung
+// does at 0.70. Scaling the buffer down as well as capping dpr was shrinking
+// it twice over, and the upscale to a 3x screen made that plainly visible.
+if (mobile && !params.has("q") && !params.has("res")) Q.scale = 1.0;
+
 {
   const a = parseInt(params.get("aa"), 10);
   if (isFinite(a)) Q.AA = Math.max(1, Math.min(4, a));
