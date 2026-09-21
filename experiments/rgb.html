@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>inv.no — rgb shadows</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #f4f5f6; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100dvh; cursor: grab; touch-action: none; }
+  canvas.drag { cursor: grabbing; }
+  #err {
+    position: fixed; inset: 0; margin: 0; padding: 1rem;
+    font: 11px/1.45 ui-monospace, Consolas, monospace;
+    color: #b00020; background: #fff; white-space: pre-wrap;
+    overflow: auto; display: none;
+  }
+  #hud {
+    position: fixed; left: 10px; bottom: 8px;
+    font: 10px/1.5 ui-monospace, Consolas, monospace;
+    color: #9aa0a6; pointer-events: none; display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<pre id="err"></pre>
+<div id="hud"></div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform vec3  uCam;        // yaw, pitch, distance
+uniform float uExposure;
+uniform vec3  uLight;      // orbit radius, orbit speed, intensity
+uniform float uObj;        // caster depth, as a multiple of the camera distance
+
+#define PI 3.141592653589793
+
+// ---------------------------------------------------------------------------
+// A white wall and three point lights -- pure red, green, blue -- at slightly
+// different positions. The object casting the shadow sits BEHIND the camera,
+// so it is never in frame. All that is ever drawn is the wall.
+//
+// Each light contributes to its own channel only, so the colour at any point
+// is a readout of which lights can see it:
+//
+//   all three reach    ->  white
+//   one blocked        ->  the other two sum: cyan, magenta or yellow
+//   two blocked        ->  a pure primary
+//   all three blocked  ->  black, the true umbra
+//
+// Nothing is coloured. The colour IS the visibility test.
+//
+// On crispness: a point light has no penumbra at all. The shadow boundary is
+// a step function, and any softness is something the renderer adds rather
+// than something the optics produce. So occlusion here is binary and the edge
+// is resolved by supersampling. Penumbra comes from a light having SIZE --
+// ?soft= reintroduces that as an angular radius if it is wanted.
+// ---------------------------------------------------------------------------
+const vec2  WM_C    = vec2(2.355, 0.739);   // measured centre of sdWord
+
+const float FOCAL   = 1.70;
+
+// Framing is width-based, and the shadow is 6.00 wide.
+//
+//   SAFE_X  is a hard floor -- get closer than this and the mark crops.
+//   FRAME_X is the default -- 3.00 / 4.50 puts the shadow across two thirds
+//           of the viewport width, leaving the lit wall as the frame.
+//
+// Both are resolved against the live aspect rather than baked into a camera
+// distance, so rotating a phone reframes instead of cropping.
+const float SAFE_X  = 3.15;
+const float FRAME_X = 4.50;
+
+// Depths are multiples of the camera distance, which makes the geometry
+// scale-invariant: the magnification is a pure ratio, so nothing has to be
+// retuned when a narrow viewport pushes the camera back. uObj is live, so
+// scrolling walks the caster between the camera and the lights and the whole
+// shadow geometry follows -- size, stroke, and how far the three separate.
+//
+//   magnification M = LIGHT_MUL / (LIGHT_MUL - uObj)
+//   shadow width    = 4.996 * M
+//   a light offset of d shifts its shadow by (M-1)*d
+
+const float LIGHT_MUL = 7.50;
+
+__GLYPHS__
+
+// The three orbits are deliberately different shapes. Identical ones would
+// hold the shadows in a fixed formation and the colour pattern would never
+// change; these drift in and out of alignment.
+vec3 lightPos(float phase, float lightZ) {
+  float a = uTime * uLight.y + phase;
+  return vec3(cos(a), sin(a * 0.83), 0.0) * uLight.x + vec3(0.0, 0.30, lightZ);
+}
+
+// ---------------------------------------------------------------------------
+// Occlusion, solved rather than marched.
+//
+// The caster is a flat 2D shape, and a shadow is a silhouette -- so there is
+// no need to sphere-trace a solid at all. Find where the segment from the wall
+// point to the light crosses the caster's plane, and ask the 2D field whether
+// that crossing is inside the letterforms. One sdWord call per light instead
+// of up to 32 marched evaluations.
+//
+// It is also exactly right rather than approximately: no step size, no
+// termination epsilon, no marching error at the boundary. The hard edge is
+// genuinely a step function and the only thing softening it is supersampling.
+//
+// Dropping the caster's thickness costs nothing visible. With the lights this
+// far back the rays are near-perpendicular to it, so the xy drift across a
+// 0.44-deep slab would be about 0.034 -- an eighth of a stroke width.
+// ---------------------------------------------------------------------------
+float shadowTo(vec3 p, vec3 lp, float objZ) {
+  float dz = lp.z - p.z;
+  if (abs(dz) < 1e-5) return 1.0;
+
+  float u = (objZ - p.z) / dz;          // where the plane sits along the segment
+  if (u <= 0.0 || u >= 1.0) return 1.0; // caster is not between point and light
+
+  float d = sdWord(mix(p.xy, lp.xy, u) + WM_C);
+
+  // SOFT is a penumbra width at the wall. Folded at compile time, so the hard
+  // path really is a single comparison.
+  if (SOFT > 1e-6) return smoothstep(0.0, SOFT, d);
+  return d < 0.0 ? 0.0 : 1.0;
+}
+
+// One light. Written out three times rather than looped over an array: GLSL ES
+// 1.00 is fussy about indexing a const array with a loop counter and some
+// mobile drivers refuse it outright.
+//
+// Attenuation is normalised against the on-axis distance so intensity does not
+// change as the camera moves. At this range inverse-square varies by under
+// half a percent across the frame, which is why the lit wall is an even field
+// rather than a vignette.
+vec3 contrib(vec3 p, vec3 n, float phase, vec3 col, float objZ, float lightZ) {
+  vec3 lp = lightPos(phase, lightZ);
+  vec3 d  = lp - p;
+  float dist = length(d);
+  vec3 l = d / dist;
+  float ndl = max(dot(n, l), 0.0);
+  float atten = (lightZ * lightZ) / (dist * dist);
+  return col * ndl * atten * shadowTo(p, lp, objZ) * uLight.z;
+}
+
+vec3 aces(vec3 x) {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+float hash12(vec2 p) {
+  vec3 q = fract(vec3(p.xyx) * 0.1031);
+  q += dot(q, q.yzx + 33.33);
+  return fract((q.x + q.y) * q.z);
+}
+
+vec3 shade(vec2 uv) {
+  float aspect = uRes.x / uRes.y;
+  // uCam.z of 0 means auto-frame: follow the viewport rather than a fixed
+  // distance. Anything else is an explicit camera, still floored at SAFE_X.
+  float kx   = max(aspect * 0.5 / FOCAL, 1e-3);
+  float dist = max(uCam.z > 0.0 ? uCam.z : FRAME_X / kx, SAFE_X / kx);
+
+  float objZ   = dist * uObj;
+  float lightZ = dist * LIGHT_MUL;
+
+  vec3 ta = vec3(0.0);
+  vec3 ro = ta + vec3(sin(uCam.x) * cos(uCam.y), sin(uCam.y), cos(uCam.x) * cos(uCam.y)) * dist;
+  vec3 fw = normalize(ta - ro);
+  vec3 rt = normalize(cross(fw, vec3(0.0, 1.0, 0.0)));   // camera is on +z
+  vec3 up = cross(rt, fw);
+  vec3 rd = normalize(fw * FOCAL + rt * uv.x + up * uv.y);
+
+  // Only the wall is ever drawn, and it is an exact plane -- one division, no
+  // marching at all. The caster exists purely as an occluder for shadow rays.
+  if (rd.z > -1e-4) return vec3(0.02);
+  float t = -ro.z / rd.z;
+  if (t <= 0.0) return vec3(0.02);
+
+  vec3 p = ro + rd * t;
+  vec3 n = vec3(0.0, 0.0, 1.0);
+
+  vec3 col = vec3(0.010);        // a hair of fill so the umbra is not a void
+  col += contrib(p, n, 0.0,       vec3(1.0, 0.0, 0.0), objZ, lightZ);
+  col += contrib(p, n, 2.0943951, vec3(0.0, 1.0, 0.0), objZ, lightZ);
+  col += contrib(p, n, 4.1887902, vec3(0.0, 0.0, 1.0), objZ, lightZ);
+  return col;
+}
+
+void main() {
+  // With a hard shadow the boundary is a step function, so supersampling is
+  // the only thing resolving it -- worth more rays here than in a scene made
+  // of soft gradients.
+  vec3 col = vec3(0.0);
+  const mat2 skew = mat2(0.8944, -0.4472, 0.4472, 0.8944);
+  for (int j = 0; j < AA; j++) {
+    for (int i = 0; i < AA; i++) {
+      vec2 o = (vec2(float(i), float(j)) + 0.5) / float(AA) - 0.5;
+      col += shade((gl_FragCoord.xy + skew * o - 0.5 * uRes) / uRes.y);
+    }
+  }
+  col /= float(AA * AA);
+
+  col *= uExposure;
+  col = aces(col);
+  col = pow(col, vec3(0.4545));
+  col += (hash12(gl_FragCoord.xy + fract(uTime) * 61.0) - 0.5) / 255.0;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script src="../wordmark.js"></script>
+<script>
+const canvas = document.getElementById("c");
+const errBox = document.getElementById("err");
+const hud    = document.getElementById("hud");
+
+function fail(msg) {
+  errBox.style.display = "block";
+  errBox.textContent = msg;
+  canvas.style.display = "none";
+  hud.style.display = "none";
+}
+
+const gl = canvas.getContext("webgl", { antialias: false, alpha: false, depth: false, powerPreference: "high-performance" })
+        || canvas.getContext("experimental-webgl");
+if (!gl) fail("WebGL is not available in this browser.");
+
+const params = new URLSearchParams(location.search);
+if (params.has("hud")) hud.style.display = "block";
+const mobile = matchMedia("(pointer: coarse)").matches;
+const DEV = params.has("hud") || params.has("dev");
+const say = (...a) => { if (DEV) console.log(...a); };
+
+function num(name, dflt) {
+  const v = parseFloat(params.get(name));
+  return isFinite(v) ? v : dflt;
+}
+
+// The scene is one analytic plane plus three solved shadow tests -- there is
+// no march anywhere -- so a pixel costs exactly 3 sdWord calls per ray. That
+// is cheap enough that the whole budget goes into rays per pixel, the only
+// thing that resolves a hard shadow edge.
+const PRESETS = {
+  low:    { AA: 2, scale: 0.60, dprCap: 1.0 },
+  medium: { AA: 3, scale: 0.80, dprCap: 1.0 },
+  high:   { AA: 3, scale: 1.00, dprCap: 1.0 },
+  ultra:  { AA: 4, scale: 1.25, dprCap: 1.5 },
+};
+const qName = params.get("q") || (mobile ? "medium" : "high");
+const Q = { ...(PRESETS[qName] || PRESETS.high) };
+
+if (mobile && !params.has("q") && !params.has("res")) Q.scale = 1.0;
+{
+  const a = parseInt(params.get("aa"), 10);
+  if (isFinite(a)) Q.AA = Math.max(1, Math.min(4, a));
+  const r = parseFloat(params.get("res"));
+  if (isFinite(r)) Q.scale = Math.max(0.25, Math.min(2.0, r));
+}
+const EV = num("ev", 1.0);
+
+// sep drives how far apart the three shadows land, and so how much colour
+// there is. The shadow stroke is 0.312 wide and a light offset shifts its
+// shadow by 0.20x, so a 0.54 orbit radius puts the gap at about 0.6 of the
+// stroke: broad CMY cores with pure RGB along the fringes. Push it much
+// higher and the three separate into distinct primaries with no mixing.
+const light = { sep: num("sep", 0.54), speed: num("speed", 0.22), power: num("power", 1.0) };
+
+// 0 = a true point light, which has no penumbra whatsoever. Raise it to give
+// the lights an angular size and soften the edge.
+const SOFT = num("soft", 0.0);
+
+// dist 0 = auto-frame; the shader picks the distance from the live aspect.
+const CAM_DEFAULT = { yaw: 0.0, pitch: 0.0, dist: 0.0 };
+const FOCAL = 1.70, FRAME_X = 4.50, LIGHT_MUL = 7.50, WM_HW = 2.498;  // match the shader
+const autoDist = () => FRAME_X / Math.max((canvas.width / canvas.height) * 0.5 / FOCAL, 1e-3);
+const cam = { ...CAM_DEFAULT };
+{
+  const raw = params.get("cam");
+  if (raw) {
+    const v = raw.split(",").map(Number);
+    if (v.length === 3 && v.every(isFinite)) {
+      cam.yaw = Math.max(-0.35, Math.min(0.35, v[0]));
+      cam.pitch = Math.max(-0.30, Math.min(0.30, v[1]));
+      cam.dist = v[2] === 0 ? 0 : Math.max(4.0, Math.min(80, v[2]));
+    } else {
+      console.warn("?cam= expects yaw,pitch,dist -- ignoring " + JSON.stringify(raw));
+    }
+  }
+}
+// Caster depth, as a multiple of the camera distance. The scroll wheel walks
+// it between the two limits that actually bound it:
+//
+//   OBJ_MIN  just past 1.0 -- at 1.0 the caster sits exactly at the camera,
+//            and below it the caster comes into frame.
+//   OBJ_MAX  where the magnified shadow exactly fills the framed width. Past
+//            this the wordmark would crop, so the wheel stops here.
+//
+// Both ends are derived rather than typed, so they stay correct if FRAME_X or
+// LIGHT_MUL move.
+const OBJ_MIN = 1.02;
+const OBJ_MAX = LIGHT_MUL * (1 - WM_HW / FRAME_X);
+const OBJ_DEFAULT = 1.25;
+let objMul = Math.max(OBJ_MIN, Math.min(OBJ_MAX, num("obj", OBJ_DEFAULT)));
+const magnif = () => LIGHT_MUL / (LIGHT_MUL - objMul);
+
+const distStr = () => (cam.dist === 0 ? "0" : cam.dist.toFixed(2));
+const camStr = () => cam.yaw.toFixed(3) + "," + cam.pitch.toFixed(3) + "," + distStr();
+
+let logTimer = 0;
+function logCam(why) {
+  clearTimeout(logTimer);
+  logTimer = setTimeout(() => {
+    say("camera (" + why + ")\n" +
+        "  yaw " + cam.yaw.toFixed(3) + "  pitch " + cam.pitch.toFixed(3) +
+          "  dist " + (cam.dist === 0 ? "auto (" + autoDist().toFixed(2) + ")" : cam.dist.toFixed(2)) + "\n" +
+        "  caster " + objMul.toFixed(3) + "x  ->  magnification " + magnif().toFixed(3) +
+          "x   shadow " + (4.996 * magnif()).toFixed(2) + " wide (" +
+          (100 * WM_HW * magnif() / FRAME_X).toFixed(0) + "% of frame)   stroke " +
+          (0.26 * magnif()).toFixed(3) + "\n" +
+        "  ?cam=" + camStr() +
+          "   ?sep=" + light.sep + " ?speed=" + light.speed +
+          " ?power=" + light.power + " ?soft=" + SOFT + " ?obj=" + objMul.toFixed(3));
+  }, 220);
+}
+
+function compile(type, src, label) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(s);
+    const numbered = src.split("\n").map((l, i) => String(i + 1).padStart(4) + " | " + l).join("\n");
+    throw new Error(label + " failed to compile:\n\n" + log + "\n\n" + numbered);
+  }
+  return s;
+}
+
+let prog, U = {}, ok = false;
+try {
+  const fsSrc = `#define AA ${Q.AA}\n`
+    + `#define SOFT ${SOFT.toFixed(5)}\n`
+    + document.getElementById("fs").textContent.replace("__GLYPHS__", WORDMARK_GLSL);
+
+  prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, document.getElementById("vs").textContent, "vertex"));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc, "fragment"));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error("program failed to link:\n\n" + gl.getProgramInfoLog(prog));
+
+  gl.useProgram(prog);
+  for (const k of ["uRes", "uTime", "uCam", "uExposure", "uLight", "uObj"]) U[k] = gl.getUniformLocation(prog, k);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(prog, "aPos");
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  ok = true;
+} catch (e) {
+  fail(String(e.message || e));
+}
+
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, Q.dprCap) * Q.scale;
+  const w = Math.max(1, Math.round(canvas.clientWidth  * dpr));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+
+// The orbit is deliberately tight: swing far enough and the caster, which sits
+// just behind the camera, comes back into frame.
+let drag = null;
+function pt(e) { const t = e.touches ? e.touches[0] : e; return { x: t.clientX, y: t.clientY }; }
+function down(e) { drag = pt(e); canvas.classList.add("drag"); }
+function move(e) {
+  if (!drag) return;
+  const p = pt(e);
+  cam.yaw   = Math.max(-0.35, Math.min(0.35, cam.yaw   + (p.x - drag.x) * 0.002));
+  cam.pitch = Math.max(-0.30, Math.min(0.30, cam.pitch + (p.y - drag.y) * 0.0015));
+  drag = p;
+  logCam("drag");
+    e.preventDefault();
+}
+function up() { drag = null; canvas.classList.remove("drag"); }
+// Tuning controls, same gating as the other experiments: a visitor gets the
+// intended straight-on view, ?hud or ?dev hands over the camera and caster.
+if (DEV) {
+  canvas.addEventListener("mousedown", down);
+  addEventListener("mousemove", move);
+  addEventListener("mouseup", up);
+  canvas.addEventListener("touchstart", down, { passive: true });
+  canvas.addEventListener("touchmove", move, { passive: false });
+  canvas.addEventListener("touchend", up);
+
+  // Wheel walks the caster in and out; shift+wheel is camera zoom.
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    const step = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+    if (e.shiftKey) {
+      if (cam.dist === 0) cam.dist = autoDist();   // leave auto on the first zoom
+      cam.dist = Math.max(4.0, Math.min(80, cam.dist * Math.exp(step * 0.0011)));
+      logCam("zoom");
+      return;
+    }
+    objMul = Math.max(OBJ_MIN, Math.min(OBJ_MAX, objMul * Math.exp(-step * 0.0011)));
+    logCam("caster");
+  }, { passive: false });
+
+  addEventListener("keydown", e => {
+    if (e.key === "r" || e.key === "R") {
+      Object.assign(cam, CAM_DEFAULT);
+      objMul = OBJ_DEFAULT;
+      logCam("reset");
+    }
+  });
+}
+
+let running = true, raf = 0, frames = 0, lastHud = 0;
+const t0 = performance.now();
+
+function frame(now) {
+  if (!running) return;
+  resize();
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, (now - t0) / 1000);
+  gl.uniform3f(U.uCam, cam.yaw, cam.pitch, cam.dist);
+  gl.uniform1f(U.uExposure, EV);
+  gl.uniform3f(U.uLight, light.sep, light.speed, light.power);
+  gl.uniform1f(U.uObj, objMul);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  frames++;
+  if (now - lastHud > 500) {
+    hud.textContent = `${(frames / ((now - lastHud) / 1000)).toFixed(0)} fps  ·  ${qName}` +
+      `  AA ${Q.AA}x${Q.AA} @ ${Q.scale.toFixed(2)}  ${canvas.width}x${canvas.height}` +
+      `  ·  obj ${objMul.toFixed(2)}x  M ${magnif().toFixed(2)}x  sep ${light.sep}  soft ${SOFT}${SOFT === 0 ? " (hard)" : ""}` +
+      `  ·  wheel = caster depth, shift+wheel = zoom  ·  ?obj= ?sep= ?speed= ?power= ?soft= ?cam= ?q= ?aa= ?res= ?ev=`;
+    frames = 0; lastHud = now;
+  }
+  raf = requestAnimationFrame(frame);
+}
+if (ok) raf = requestAnimationFrame(frame);
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { running = false; cancelAnimationFrame(raf); }
+  else if (ok) { running = true; lastHud = performance.now(); frames = 0; raf = requestAnimationFrame(frame); }
+});
+addEventListener("resize", resize);
+
+canvas.addEventListener("webglcontextlost", e => {
+    e.preventDefault();
+  running = false;
+  cancelAnimationFrame(raf);
+  setTimeout(() => location.reload(), 350);
+});
+
+logCam("initial");
+</script>
+</body>
+</html>

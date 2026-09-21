@@ -37,32 +37,58 @@
 <script>
 // inv.no is a rotating set of graphic experiments. Each one is a standalone
 // page under experiments/ -- openable and tunable on its own -- and this
-// launcher picks one per visit by weight.
+// launcher decides which one a visit gets.
 //
-// Weights are relative, not percentages, so adding an experiment does not mean
-// recalculating the others. Equal weights here means an even split.
+// Order beats randomness here. A random pick repeats: with four experiments
+// there is a 1-in-4 chance of seeing the same one twice running, and no
+// guarantee of ever seeing all of them. So a visit ADVANCES through the list
+// and the position rides in a session cookie -- you see every experiment once
+// before any of them comes round again.
+//
+// The starting point is still random, so two visitors do not begin at the same
+// place, and the cookie carries no expiry: closing the browser starts a fresh
+// cycle rather than resuming a stale one.
 const EXPERIMENTS = [
-  { name: "ascii",    src: "experiments/ascii.html",    weight: 50 },
-  { name: "monolith", src: "experiments/monolith.html", weight: 50 },
-  { name: "emerge",   src: "experiments/emerge.html",   weight: 50 },
+  { name: "ascii",    src: "experiments/ascii.html"    },
+  { name: "monolith", src: "experiments/monolith.html" },
+  { name: "emerge",   src: "experiments/emerge.html"   },
+  { name: "rgb",      src: "experiments/rgb.html"      },
 ];
+
+const COOKIE = "inv_x";
 
 const params = new URLSearchParams(location.search);
 
+function readPos() {
+  const hit = document.cookie.split(";").map(c => c.trim())
+    .find(c => c.indexOf(COOKIE + "=") === 0);
+  if (!hit) return null;
+  const n = parseInt(hit.slice(COOKIE.length + 1), 10);
+  // A cookie left over from a shorter list must not pin the cycle out of range
+  return Number.isInteger(n) && n >= 0 && n < EXPERIMENTS.length ? n : null;
+}
+
+function writePos(i) {
+  // No Max-Age and no Expires is what makes this a session cookie: it lives in
+  // memory and goes with the browser. Nothing reads it but this page, so Lax
+  // is the right SameSite and there is nothing here worth a server round trip.
+  document.cookie = COOKIE + "=" + i + "; path=/; SameSite=Lax";
+}
+
 function pick() {
-  // ?x=<name> forces one, for linking and for testing a specific experiment
+  // ?x=<name> forces one, for linking and for testing a specific experiment.
+  // It deliberately leaves the cycle where it was.
   const forced = params.get("x");
   if (forced) {
     const hit = EXPERIMENTS.find(e => e.name === forced);
     if (hit) return hit;
   }
-  const total = EXPERIMENTS.reduce((s, e) => s + e.weight, 0);
-  let r = Math.random() * total;
-  for (const e of EXPERIMENTS) {
-    r -= e.weight;
-    if (r < 0) return e;
-  }
-  return EXPERIMENTS[0];
+  const last = readPos();
+  const next = last === null
+    ? Math.floor(Math.random() * EXPERIMENTS.length)   // first visit of a session
+    : (last + 1) % EXPERIMENTS.length;
+  writePos(next);
+  return EXPERIMENTS[next];
 }
 
 const chosen = pick();
