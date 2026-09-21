@@ -110,6 +110,23 @@ document.body.appendChild(frame);
 frame.addEventListener("load", () => { try { frame.contentWindow.focus(); } catch (e) {} });
 
 document.documentElement.dataset.experiment = chosen.name;
+
+// Telemetry. One pageview per visit, attributed to the experiment that was
+// actually shown rather than all of them piling up under "/". GoatCounter
+// sets no cookie and stores no identifier, so there is nothing here that
+// needs a consent banner.
+//
+// It lives in the launcher rather than in the experiments: those run in an
+// iframe, so a tag inside one would report the frame URL, and it would also
+// fire every time an experiment is opened directly for tuning.
+//
+// ?hud and ?dev mean someone is tuning, not visiting, so those are not
+// counted at all -- that holds even on a browser where the GoatCounter
+// "ignore my own visits" flag has not been set, such as a phone.
+const TUNING = params.has("hud") || params.has("dev");
+window.goatcounter = TUNING ? { no_onload: true } : { path: "/" + chosen.name };
 </script>
+<script data-goatcounter="https://invno.goatcounter.com/count"
+        async src="https://gc.zgo.at/count.js"></script>
 </body>
 </html>
